@@ -34,10 +34,11 @@ Kết quả: results_fix/*.json, bảng so sánh results_fix/KET_QUA_FIX.md, log
 
 Đợt 6 (--dot6): đủ ma trận đề cương. Giảm token ở đầu vào, lr backbone 5e-5, --prune_norm, patience 0 (tự bật).
   Pha 1. CIFAR-100, 30 epoch: baseline 100% token x 3 seed, rồi KANPool, MLP Pool, Avg Pool, Max Pool, KAN Prune,
-         MLP Prune x giữ 75 / 50 / 25% x 3 seed (seed 0 của mọi mức chạy trước); Static Drop 75% / 25% chạy cuối.
+         MLP Prune x giữ 75 / 50 / 25% x 3 seed (seed 0 của mọi mức chạy trước).
          16 job giữ 50% đã có (results_lr, cùng cấu hình) nằm ở prev_results/lr5e-5/, được chép vào --out: không chạy lại.
          Cùng pha: baseline Tiny-ImageNet và ImageNet-100 (seed 0, --ext_epochs epoch), lưu làm teacher.
-  Pha 2. Tiny-ImageNet, ImageNet-100 rút gọn: 6 phương pháp, giữ 50%, seed 0, chưng cất từ teacher cùng dataset.
+  Pha 2. Tiny-ImageNet, ImageNet-100 rút gọn: 6 phương pháp, giữ 50%, seed 0, chưng cất từ teacher cùng dataset;
+         sau cùng là phần phụ Static Drop giữ 75% / 25% x 3 seed trên CIFAR-100.
          Thiếu data/imagenet-100 (scripts/prep_imagenet100.py) thì bỏ qua phần ImageNet-100.
   Bảng: <out>/KET_QUA_DOT6.md, hình: <out>/fig_dot6_cifar100.png
 """
@@ -188,8 +189,8 @@ def jobs_dot6(a):
     if a.quick:  # chạy thử: đủ mọi loại job (baseline, gộp, loại bỏ, teacher, mỗi dataset) nhưng ít job
         keep = {("identity", 1.0, 0), ("kan_pool", 0.25, 0), ("max_pool", 0.75, 0), ("kan_prune", 0.25, 0)}
         return [[j for j in cifar if j[:3] in keep] + teachers, [j for j in rest if j[0] in ("kan_pool", "kan_prune")]]
-    # thứ tự pha 1: baseline + seed 0 mọi mức (đủ một đường cong sớm), teacher, seed 1/2, Static Drop
-    return [cifar[:21] + teachers + cifar[21:] + static, rest]
+    # pha 1: baseline + seed 0 mọi mức (đủ một đường cong sớm), teacher, seed 1/2. Static Drop là phần phụ: cuối pha 2
+    return [cifar[:21] + teachers + cifar[21:], rest + static]
 
 
 def result_name(r, ratio, seed, tag, dataset="cifar100"):
