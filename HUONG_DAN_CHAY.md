@@ -3,6 +3,9 @@
 Một lệnh chạy toàn bộ đợt 7: `scripts/run_fix.py --dot7`. Hai tập chính CIFAR-100 và Food-101; Tiny-ImageNet và
 ImageNet-100 chạy một phần. Bảng kết quả tự sinh: `results_dot7/KET_QUA_DOT7.md`.
 
+**Đang dùng bản gọn** (`--dot7 --lite`, 43 job, xem mục "Bản gọn" bên dưới). Các bước 5 và 6 ghi sẵn lệnh của cả hai bản:
+chép đúng dòng của bản mình chạy.
+
 Hướng dẫn của các đợt trước (`scripts/run_plan.py`, Kaggle / Colab, đợt 1–6 của `run_fix.py`) không còn dùng; xem lại
 trong lịch sử git: `git show 8e503ed:HUONG_DAN_CHAY.md` và `git show 8e503ed:HUONG_DAN_CHAY_FIX.md`.
 
@@ -31,8 +34,9 @@ Nội dung (cùng cấu hình đợt 6: giảm ở đầu vào, lr backbone 5e-5
 **99 job: pha 1 (6 job) ~2,5 giờ, pha 2 (93 job, chủ yếu Food-101 ~85–90 phút/job) ~62 giờ trên 2 × RTX 4090.**
 Pha 2 xếp theo seed: seed 0 của mọi job Food-101 xong trước (~18 giờ), dừng giữa chừng vẫn có đủ một đường cong.
 
-**Bản gọn `--dot7 --lite` (43 job, ~57 giờ-GPU: ~29 giờ trên 2 × 4090, ~12–15 giờ trên 4 × 4090):** thêm `--lite` vào
-mọi lệnh `run_fix` dưới đây (cả chạy thử) và **không tải ImageNet-100** (bỏ bước 3).
+**Bản gọn `--dot7 --lite` (43 job, ~57 giờ-GPU: ~29 giờ trên 2 × 4090, ~12–15 giờ trên 4 × 4090):** bước 5 và 6 có sẵn
+lệnh với `--lite`. **Quên `--lite` ở bất kỳ lệnh `run_fix` nào (kể cả khi chạy lại sau sự cố) là chạy bản đầy đủ 99 job.**
+**Không tải ImageNet-100** (bỏ bước 3): có `data/imagenet-100` thì `--lite` chạy thêm 8 job ImageNet-100 (51 job).
 - Giữ: Food-101 seed 0 đủ ma trận (baseline làm teacher + 7 phương pháp × 3 mức giữ + giảm độ phân giải × 3), giảm độ
   phân giải CIFAR-100 × 3 seed, Static Drop Tiny-ImageNet.
 - Seed 1 / 2 của Food-101 chỉ ở giữ 25%: KANPool, MLP Pool, Static Drop, giảm độ phân giải 112 px (chỗ Pool so với
@@ -47,6 +51,7 @@ mọi lệnh `run_fix` dưới đây (cả chạy thử) và **không tải Imag
 **0. Thuê máy:** vast.ai / RunPod, **2 × RTX 4090** (không chọn RTX 5090 / RTX PRO Blackwell), image
 `pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel`, **disk ≥ 100 GB** (Food-101 ~10 GB, ImageNet-100 ~30 GB, checkpoint,
 kết quả). Thời gian chạy ~60 giờ: chọn máy cho thuê dài, không bị ngắt (không dùng "interruptible").
+Bản gọn: ~29 giờ trên 2 × 4090 hoặc ~12–15 giờ trên 4 × 4090; nên đặt disk 150 GB.
 
 **1. Đưa code và kết quả đợt 6 lên `/workspace`:** code lấy bằng
 `cd /workspace && git clone -b dot7 https://github.com/dqminh24/Kan-vim.git kan-vim` (khi đó bỏ qua lệnh giải nén
@@ -62,7 +67,7 @@ ls results_dot6/teacher_tiny-imagenet.pt       # phải có (nếu thấy result
 python -c "from huggingface_hub import hf_hub_download as d; import shutil; shutil.copy(d('hustvl/Vim-tiny-midclstok', 'vim_t_midclstok_76p1acc.pth'), 'vim_t.pth')"
 ```
 
-**3. ImageNet-100 (tuỳ chọn, ~30–60 phút; bỏ qua thì đợt 7 tự bỏ 8 job ImageNet-100):** bản Kaggle của Ambesh
+**3. ImageNet-100 (tuỳ chọn, ~30–60 phút; bỏ qua thì đợt 7 tự bỏ 8 job ImageNet-100). Bản gọn: bỏ bước này.** Bản Kaggle của Ambesh
 Shekhar, cần API key Kaggle (kaggle.com → Settings → API → Create New Token → file `kaggle.json`).
 ```bash
 pip install -q kaggle && mkdir -p ~/.kaggle && cp /workspace/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
@@ -72,38 +77,54 @@ python scripts/prep_imagenet100.py /workspace/in100      # phải in "thấy 100
 
 **4. Kiểm tra (bắt buộc, ~5 phút):**
 ```bash
-python -m pytest -q                            # phải thấy "90 passed" (nhánh dot7-gon; nhánh dot7: 85)
+python -m pytest -q                            # phải thấy "90 passed"
 python scripts/check_impl.py vim_t.pth         # phải in 2 dòng (224 px, 160 px) và USE_OFFICIAL
 ```
 Không thấy `USE_OFFICIAL` thì vẫn chạy được (bản pure, chậm hơn ~25%), nhưng tốc độ không so được với đợt 6: nên
 kiểm lại `setup_rent.sh` trước.
 
-**5. Chạy thử (~40–60 phút, gồm tải Food-101 ~5 GB lần đầu):** 10 job × (2 epoch × 20 bước), mỗi loại job một lần.
+**5. Chạy thử (~40–60 phút, gồm tải Food-101 ~5 GB lần đầu):** mỗi loại job một lần, 2 epoch × 20 bước.
+
+Bản gọn (7 job; 6 nếu thiếu teacher Tiny-ImageNet):
 ```bash
-bash scripts/run_fix.sh --dot7 --quick && tail -f run_fix.log       # Ctrl+C chỉ thoát xem, không dừng chạy
+bash scripts/run_fix.sh --dot7 --lite --quick && tail -f run_fix.log   # Ctrl+C chỉ thoát xem, không dừng chạy
+```
+Bản đầy đủ (10 job):
+```bash
+bash scripts/run_fix.sh --dot7 --quick && tail -f run_fix.log
 ```
 Chờ log in `XONG CHẠY THỬ` / `XONG TOÀN BỘ` (hoặc `XONG, có job lỗi`: xem `results_quick_dot7/logs/<tên job>.log`). Kiểm:
 - `results_quick_dot7/KET_QUA_DOT7.md`, mục "Dữ liệu và biến đổi ảnh": Food-101 và ImageNet-100 là `RandomResizedCrop`,
   CIFAR-100 / Tiny-ImageNet là `RandomCrop(... padding_mode=reflect)`, không có dòng **CẢNH BÁO**.
 - `grep -h "distill=\|patch tokens" results_quick_dot7/logs/*res160*.log` phải có `100 patch tokens` và
   `distill=on (teacher 224 px)`.
-- `grep -h "data:" results_quick_dot7/logs/imagenet-100*.log` phải là `train ~130000 | val 2500 | test 2500`.
+- Chỉ bản đầy đủ (có tải ImageNet-100): `grep -h "data:" results_quick_dot7/logs/imagenet-100*.log` phải là
+  `train ~130000 | val 2500 | test 2500`.
 - Đầu `run_fix.log` không có dòng `CẢNH BÁO: thiếu ... teacher`.
 
 **5b. Đo thời gian thật trước khi chi tiền (~2 phút):** ước tính 85–90 phút/job Food-101 lấy từ ImageNet-100, chưa đo.
 ```bash
 python train.py --dataset food101 --data_root data --ckpt vim_t.pth --impl official --batch 64 --workers 12   --val_size 5000 --reducer kan_pool --ratio 0.5 --teacher_ckpt results_quick_dot7/teacher_food101.pt --timing
 ```
-Dòng `TIMING ... 1 epoch ~= X min`: một job Food-101 ≈ 30 × X phút, cả đợt ≈ 75 × 30 × X / 2 phút trên 2 GPU (cộng
-~10 giờ cho CIFAR-100 / ImageNet-100). Nếu `data` chiếm phần lớn thời gian mỗi bước thì máy thiếu CPU: tăng `--workers`
+Dòng `TIMING ... 1 epoch ~= X min`: một job Food-101 ≈ 30 × X phút. Cả đợt ≈ (số job Food-101 × 30 × X phút + phần
+còn lại) ÷ số GPU: bản đầy đủ 75 job Food-101, phần còn lại ~20 giờ-GPU (CIFAR-100 / ImageNet-100); bản gọn 33 job
+Food-101, phần còn lại ~6 giờ-GPU (CIFAR-100 / Tiny-ImageNet). Nếu `data` chiếm phần lớn thời gian mỗi bước thì máy thiếu CPU: tăng `--workers`
 hoặc chọn máy nhiều nhân hơn trước khi chạy thật.
 
-**6. Chạy thật (~58 giờ, nền, kết quả ở `results_dot7/`, tách riêng với chạy thử):**
+**6. Chạy thật (nền, kết quả ở `results_dot7/`, tách riêng với chạy thử):**
+
+Bản gọn (43 job; ~29 giờ trên 2 × 4090, ~12–15 giờ trên 4 × 4090):
 ```bash
-bash scripts/run_fix.sh --dot7 && tail -f run_fix.log
+OMP_NUM_THREADS=3 bash scripts/run_fix.sh --dot7 --lite && tail -f run_fix.log
 ```
-Bảng `results_dot7/KET_QUA_DOT7.md` cập nhật sau mỗi job. Mất kết nối / máy khởi động lại: chạy lại đúng lệnh này, job
-xong được giữ, job dở chạy tiếp. Muốn dừng sớm: seed 0 của mọi job Food-101 xong sau ~20 giờ đầu.
+Bản đầy đủ (99 job, ~58 giờ trên 2 × 4090):
+```bash
+OMP_NUM_THREADS=3 bash scripts/run_fix.sh --dot7 && tail -f run_fix.log
+```
+`OMP_NUM_THREADS=3`: không có nó, mỗi job mở số luồng CPU bằng số nhân của máy và các job tranh nhau CPU.
+Bảng `results_dot7/KET_QUA_DOT7.md` cập nhật sau mỗi job. Mất kết nối / máy khởi động lại: chạy lại **đúng lệnh đã dùng
+(giữ nguyên `--lite`)**, job xong được giữ, job dở chạy tiếp. Muốn dừng sớm: seed 0 của mọi job Food-101 xong sau ~20 giờ
+đầu (bản đầy đủ, 2 GPU); bản gọn khoảng 10 giờ đầu trên 4 GPU, khoảng 21 giờ trên 2 GPU (ước tính).
 
 **7. Sau khi xong (GPU rảnh, không job nào khác chạy):** đo tốc độ cho bài (batch 1 = độ trễ, batch 64 = thông lượng;
 dòng đầu in rõ scan đang dùng), đánh giá giảm token **không huấn luyện lại** (vài phút / tập), rồi đóng gói và tải về:
