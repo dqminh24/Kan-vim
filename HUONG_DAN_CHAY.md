@@ -31,6 +31,17 @@ Nội dung (cùng cấu hình đợt 6: giảm ở đầu vào, lr backbone 5e-5
 **99 job: pha 1 (6 job) ~2,5 giờ, pha 2 (93 job, chủ yếu Food-101 ~85–90 phút/job) ~62 giờ trên 2 × RTX 4090.**
 Pha 2 xếp theo seed: seed 0 của mọi job Food-101 xong trước (~18 giờ), dừng giữa chừng vẫn có đủ một đường cong.
 
+**Bản gọn `--dot7 --lite` (43 job, ~57 giờ-GPU: ~29 giờ trên 2 × 4090, ~12–15 giờ trên 4 × 4090):** thêm `--lite` vào
+mọi lệnh `run_fix` dưới đây (cả chạy thử) và **không tải ImageNet-100** (bỏ bước 3).
+- Giữ: Food-101 seed 0 đủ ma trận (baseline làm teacher + 7 phương pháp × 3 mức giữ + giảm độ phân giải × 3), giảm độ
+  phân giải CIFAR-100 × 3 seed, Static Drop Tiny-ImageNet.
+- Seed 1 / 2 của Food-101 chỉ ở giữ 25%: KANPool, MLP Pool, Static Drop, giảm độ phân giải 112 px (chỗ Pool so với
+  Static Drop còn tranh cãi, cần 3 seed để tính KPI). Các ô Food-101 khác chỉ có 1 seed: bảng ghi "tham khảo, không
+  tính KPI". Tập test 25.250 ảnh chỉ làm nhỏ nhiễu lấy mẫu ảnh test (~±0,5 điểm ở mức tin cậy 95%), không bỏ được dao
+  động giữa các lần train (CIFAR-100: 0,1–0,4 điểm với Pool, tới 0,75–1,35 với Prune).
+- Bỏ: baseline Food-101 seed 1 / 2, đối chứng Δ, ImageNet-100 làm lại.
+- Giảm độ phân giải CIFAR-100 cả 3 seed chạy ở pha 1, cùng lúc với baseline Food-101 (không cần teacher Food-101).
+
 ## Chạy trên máy GPU mới (từng bước)
 
 **0. Thuê máy:** vast.ai / RunPod, **2 × RTX 4090** (không chọn RTX 5090 / RTX PRO Blackwell), image
@@ -61,7 +72,7 @@ python scripts/prep_imagenet100.py /workspace/in100      # phải in "thấy 100
 
 **4. Kiểm tra (bắt buộc, ~5 phút):**
 ```bash
-python -m pytest -q                            # phải thấy "85 passed"
+python -m pytest -q                            # phải thấy "90 passed" (nhánh dot7-gon; nhánh dot7: 85)
 python scripts/check_impl.py vim_t.pth         # phải in 2 dòng (224 px, 160 px) và USE_OFFICIAL
 ```
 Không thấy `USE_OFFICIAL` thì vẫn chạy được (bản pure, chậm hơn ~25%), nhưng tốc độ không so được với đợt 6: nên

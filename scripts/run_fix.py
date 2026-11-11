@@ -60,6 +60,11 @@ lr backbone 5e-5, --prune_norm, patience 0, mixup 0,2, chưng cất từ baselin
   results_dot6/: giải nén results_dot6.zip vào đó) để so trong cùng bảng; thiếu thì bảng CIFAR-100 chỉ có giảm độ
   phân giải và Static Drop Tiny-ImageNet bị bỏ qua.
   Bảng: <out>/KET_QUA_DOT7.md (có cả cấu hình biến đổi ảnh đọc lại từ json), hình: <out>/fig_dot7_<dataset>.png
+  Bản gọn (--dot7 --lite, 43 job khi có teacher Tiny-ImageNet, không tải ImageNet-100):
+  Pha 1. baseline Food-101 seed 0 (teacher), Static Drop Tiny-ImageNet, giảm độ phân giải CIFAR-100 x 3 seed (9 job).
+  Pha 2. Food-101 seed 0 đủ 7 phương pháp x 3 mức giữ + giảm độ phân giải x 3 (24 job), rồi seed 1 / 2 chỉ ở giữ 25%:
+         KANPool, MLP Pool, Static Drop, giảm độ phân giải 112 px (8 job). Không có baseline Food-101 seed 1 / 2, không
+         có đối chứng Δ; các ô Food-101 chỉ có 1 seed ghi "tham khảo, không tính KPI".
 """
 import argparse
 import glob
@@ -241,6 +246,17 @@ L6_REF = {0.5: {"kan_pool": [87.37, 87.46, 87.30], "mlp_pool": [87.26, 87.35, 87
           0.25: {"kan_pool": [85.59, 85.68, 85.51], "mlp_pool": [85.58, 85.69, 85.71], "static_drop": [85.34, 84.86, 84.96],
                  "avg_pool": [85.14, 85.32, 85.14], "kan_prune": [82.96, 82.94, 83.03], "mlp_prune": [83.13, 82.96, 83.11]}}
 L6_NAMES = {**DOT6_NAMES, "delta_prune": "Δ Prune (giữ Δ lớn)", "delta_prune_low": "Δ Prune (giữ Δ nhỏ)"}
+# --dot7 --lite (bản gọn): Food-101 seed 0 đủ ma trận; seed 1 / 2 chỉ ở giữ 25% (chỗ Pool so với Static Drop còn tranh cãi)
+LITE_SEEDS12 = {("kan_pool", 0.25, DOT6_TAG), ("mlp_pool", 0.25, DOT6_TAG), ("static_drop", 0.25, DOT6_TAG),
+                ("identity", 1.0, res_tag(DOT7_SIZE_OF[0.25]))}
+
+
+def planned_seeds(a, ds, key, ratio):
+    """Số seed của một ô trong bảng: 3, trừ Food-101 ở --lite (1 seed ngoài LITE_SEEDS12)."""
+    if not (getattr(a, "lite", False) and ds == "food101"):
+        return len(SEEDS)
+    k = ("identity", 1.0, res_tag(DOT7_SIZE_OF[ratio])) if key == LOWRES else (key, ratio, DOT6_TAG)
+    return len(SEEDS) if k in LITE_SEEDS12 else 1
 
 
 def in100_teacher(a):
@@ -274,11 +290,17 @@ def jobs_dot7(a):
     delta = [(r, q, s, DELTA_TAG, lr + ["--reduce_at", "6", "--impl", "pure"]) for s in SEEDS for q in (0.5, 0.25)
              for r in DELTA_METHODS]
     n = len(DOT7_SIZES)
+    lite = getattr(a, "lite", False)
     if a.quick:  # chạy thử: mỗi loại job một lần (teacher, chưng cất, gộp, loại bỏ, Static Drop, giảm độ phân giải)
         keep = {("kan_pool", 0.25, DOT6_TAG), ("kan_prune", 0.5, DOT6_TAG), ("static_drop", 0.5, DOT6_TAG),
                 ("identity", 1.0, res_tag(160))}
         return [food_base[:1] + in_base + ext_sd + [j for j in cifar_res[:n] if j[3] == res_tag(112)],
-                [j for j in food_seed(0) if (j[0], j[1], j[3]) in keep] + in_rest[-1:] + delta[:1]]
+                [j for j in food_seed(0) if (j[0], j[1], j[3]) in keep] + in_rest[-1:] + ([] if lite else delta[:1])]
+    if lite:  # bản gọn: không có Δ, không có baseline Food-101 seed 1/2; seed 1/2 của Food-101 chỉ ở các job LITE_SEEDS12.
+        # Giảm độ phân giải CIFAR-100 (không cần teacher Food-101) chạy ở pha 1 cho GPU khỏi rảnh khi chờ baseline Food-101;
+        # pha 2: job dài trước, nên lúc cuối không còn job dài nào chạy một mình.
+        more = lambda s: [j for j in food_seed(s) if (j[0], j[1], j[3]) in LITE_SEEDS12]
+        return [food_base[:1] + in_base + ext_sd + cifar_res, in_rest + food_seed(0) + more(1) + more(2)]
     return [food_base[:1] + in_base + ext_sd + cifar_res[:n],
             in_rest + delta + food_seed(0) + food_base[1:] + cifar_res[n:] + food_seed(1) + food_seed(2)]
 
@@ -770,9 +792,14 @@ def report_dot7(a):
         epochs = next((d["args"]["epochs"] for d in runs(ds, "kan_pool", 0.5) + runs(ds, "identity", 1.0) if d), None)
         heads = [f"Giữ {round(r * 100)}% ({f2(gm(ds, 'kan_pool', r)) if gm(ds, 'kan_pool', r) else '-'} GMACs)"
                  for r in DOT6_RATIOS]
-        L += ["", f"## {title} ({epochs or '?'} epoch, 3 seed)", "",
+        lite = getattr(a, "lite", False) and ds == "food101"
+        seeds_note = ("bản gọn: 3 seed ở giữ 25% cho KANPool, MLP Pool, Static Drop, giảm độ phân giải; các ô khác và "
+                      "baseline 1 seed" if lite else "3 seed")
+        L += ["", f"## {title} ({epochs or '?'} epoch, {seeds_note})", "",
               f"Baseline Vim-Ti (100% token, 224 px): **{fmt(base)}** (n={len(base)}).", "",
-              "Test top-1 (%), trung bình ± độ lệch; (…) = chênh so với trung bình baseline; n < 3 = chưa đủ seed.", "",
+              "Test top-1 (%), trung bình ± độ lệch; (…) = chênh so với trung bình baseline; "
+              + ("n = 1: ô chỉ chạy 1 seed (tham khảo, không tính KPI); n = 2: còn chờ seed." if lite else
+                 "n < 3 = chưa đủ seed."), "",
               "| Phương pháp | " + " | ".join(heads) + " |", "|---|---|---|---|"]
         for key in DOT7_METHODS + [LOWRES]:
             cells = []
@@ -797,7 +824,9 @@ def report_dot7(a):
             cells = []
             for ratio in DOT6_RATIOS:
                 d = paired(ds, k, m, ratio)
-                cells.append(f"{fmt_d(d)}, {kpi(d)} ({sd(d)})" if d else "-")
+                p = min(planned_seeds(a, ds, k, ratio), planned_seeds(a, ds, m, ratio))
+                verdict = f"{p} seed: tham khảo, không tính KPI" if len(d) >= p < len(SEEDS) else kpi(d)
+                cells.append(f"{fmt_d(d)}, {verdict} ({sd(d)})" if d else "-")
             L.append(f"| {name} | {' | '.join(cells)} |")
         b0 = res.get((ds, "identity", 1.0, 0, DOT6_TAG))
         if b0 and b0.get("throughput"):
@@ -815,8 +844,10 @@ def report_dot7(a):
                 L.append(f"| {DOT7_NAMES[key]} | {' | '.join(cells)} |")
         L += dot7_diag_lines(ds, runs, f2)
         plot_dot7(a, res, ds, title, runs, base)
-    L += dot7_delta_lines(res, f2)
-    L += dot7_in100_lines(res, a, f2)
+    if not getattr(a, "lite", False):  # bản gọn không chạy đối chứng Δ
+        L += dot7_delta_lines(res, f2)
+    if "imagenet-100" in a.ext_ds or any(k[0] == "imagenet-100" and k[4] == IN100_TAG for k in res):
+        L += dot7_in100_lines(res, a, f2)  # không tải ImageNet-100 thì không có job, khỏi in bảng trống
     for ds, title in {"tiny-imagenet": "Tiny-ImageNet"}.items():
         b = res.get((ds, "identity", 1.0, 0, DOT6_TAG))
         L += ["", f"## {title} (rút gọn: giữ 50%, seed 0, {a.ext_epochs} epoch; 6 phương pháp đầu và baseline lấy từ "
@@ -1010,6 +1041,10 @@ def main():
                     help="đợt 7: Food-101 đủ 7 phương pháp x giữ 75/50/25%% x 3 seed, đối chứng giảm độ phân giải "
                          "(192/160/112 px) trên CIFAR-100 và Food-101, Static Drop Tiny-ImageNet, ImageNet-100 làm lại với val sạch; "
                          "bảng KET_QUA_DOT7.md")
+    ap.add_argument("--lite", action="store_true",
+                    help="--dot7 bản gọn (~43 job): Food-101 seed 0 đủ ma trận; seed 1/2 chỉ KANPool, MLP Pool, Static Drop, "
+                         "giảm độ phân giải ở giữ 25%%; bỏ baseline Food-101 seed 1/2 và đối chứng Δ (ImageNet-100: không "
+                         "tải dữ liệu là tự bỏ)")
     ap.add_argument("--food_epochs", type=int, default=30, help="--dot7: số epoch cho Food-101 (CIFAR-100: 30)")
     ap.add_argument("--dot6_dir", default=os.path.join(ROOT, "results_dot6"),
                     help="--dot7: thư mục kết quả đợt 6 (giải nén results_dot6.zip): json để so và teacher "
@@ -1025,6 +1060,7 @@ def main():
     a = ap.parse_args()
     a.ext_ds = []  # --dot6 / --dot7: prepare() điền các dataset phụ có sẵn
     assert not (a.dot6 and a.dot7), "chọn một đợt"
+    assert a.dot7 or not a.lite, "--lite chỉ dùng với --dot7"
     if a.out is None:
         a.out = os.path.join(ROOT, ("results_quick_dot7" if a.quick else "results_dot7") if a.dot7 else "results_fix")
     if a.stab_round or a.ctx_round or a.r25_round or a.dot6 or a.dot7:
