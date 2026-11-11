@@ -143,10 +143,40 @@ class Block(nn.Module):
         return self.mixer(self.norm(residual)), residual
 
 
+def resize_pos_embed(pos, new_grid, old_grid=None):
+    """Resample a Vim abs pos-embed to another patch grid (another input resolution).
+
+    Vim (midclstok) layout: pos is (1, N+1, D) and index N//2 is the CLS slot, the other N rows are the
+    patch positions in raster order (patch_embed flattens H then W). The DeiT / timm recipe assumes the CLS
+    row comes FIRST, which would mix the CLS row into the grid here. So: take the CLS row out of the
+    middle, resample the N patch rows as a 2-D grid (bicubic, align_corners=False, antialias=True: the timm
+    convention, antialias matters when shrinking 14x14 -> 10x10 / 7x7), and put the CLS row back at the
+    middle of the new sequence (index N'//2), where VisionMamba and ReducedVim insert the CLS token."""
+    n_old = pos.shape[1] - 1
+    if old_grid is None:
+        s = math.isqrt(n_old)
+        old_grid = (s, s)
+    assert old_grid[0] * old_grid[1] == n_old, (pos.shape, old_grid)
+    new_grid = tuple(int(g) for g in new_grid)
+    if new_grid == tuple(old_grid):
+        return pos
+    t = n_old // 2
+    cls = pos[:, t:t + 1]
+    d = pos.shape[-1]
+    grid = torch.cat([pos[:, :t], pos[:, t + 1:]], 1).float().reshape(1, old_grid[0], old_grid[1], d)
+    grid = F.interpolate(grid.permute(0, 3, 1, 2), size=new_grid, mode="bicubic", align_corners=False,
+                         antialias=True)
+    grid = grid.permute(0, 2, 3, 1).reshape(1, new_grid[0] * new_grid[1], d).to(pos.dtype)
+    t = grid.shape[1] // 2
+    return torch.cat([grid[:, :t], cls, grid[:, t:]], 1)
+
+
 class PatchEmbed(nn.Module):
     def __init__(self, dim, patch=16, img=224):
         super().__init__()
+        assert img % patch == 0, f"image size {img} must be a multiple of the patch size {patch}"
         self.proj = nn.Conv2d(3, dim, patch, patch)
+        self.img_size = (img, img)
         self.grid_size = (img // patch, img // patch)
         self.num_patches = self.grid_size[0] * self.grid_size[1]
 
@@ -188,11 +218,13 @@ VIM_HF = {"tiny": ("hustvl/Vim-tiny-midclstok", "vim_t_midclstok_76p1acc.pth"),
           "small": ("hustvl/Vim-small-midclstok", "vim_s_midclstok_80p5acc.pth")}
 
 
-def load_vim_pure(name="tiny", ckpt=None, num_classes=100):
-    m = VimPure(**VIM_CFG[name])
+def load_vim_pure(name="tiny", ckpt=None, num_classes=100, img_size=224):
+    """img_size != 224: patch grid img_size/16, the checkpoint's 14x14 pos-embed is resampled (resize_pos_embed)."""
+    m = VimPure(**VIM_CFG[name], img=img_size)
     if ckpt:
         sd = torch.load(ckpt, map_location="cpu", weights_only=False)
-        sd = sd.get("model", sd)
+        sd = dict(sd.get("model", sd))
+        sd["pos_embed"] = resize_pos_embed(sd["pos_embed"], m.patch_embed.grid_size)
         missing, unexpected = m.load_state_dict(sd, strict=False)
         if missing or unexpected:
             raise RuntimeError(f"checkpoint mismatch\nmissing={missing}\nunexpected={unexpected}")

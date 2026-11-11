@@ -5,9 +5,11 @@
 ```
 kanvim/kan_layers.py   RBF-KAN layer, KAN/MLP scorers, parameter matching (RQ2)
 kanvim/reducers.py     avg/max pool, static/random drop, MLP/KAN pool, MLP/KAN prune
-kanvim/model.py        ReducedVim = Vim + reducer after patch embedding; load_vim()
+kanvim/model.py        ReducedVim = Vim + reducer after patch embedding; load_vim(img_size=...) for the
+                       lower-resolution control (train.py --img_size 192/160/112)
 kanvim/metrics.py      GMACs (analytic Vim + reducer), throughput, peak VRAM
-kanvim/data.py         CIFAR-100, Tiny-ImageNet, ImageNet-100 (all resized to 224)
+kanvim/data.py         CIFAR-100, Food-101, Tiny-ImageNet, ImageNet-100 (loaders give 224 px; the transforms
+                       actually used are written into every result json)
 kanvim/vim_pure.py     pure-PyTorch Vim (loads official ckpt; no mamba-ssm build needed)
 kanvim/tinyvim.py      tiny CPU stand-in backbone for tests
 kanvim/mtr.py          MTR (training-free, Delta-based) reference
@@ -19,8 +21,8 @@ tests/                 pytest (CPU): shapes, order, grads, param matching, MACs 
 ```
 
 ## Chạy toàn bộ thí nghiệm
-Xem `HUONG_DAN_CHAY.md`: `python scripts/run_plan.py --profile gpu --budget_hours 30` chạy dò LR, baseline,
-6 phương pháp × 3 mức giữ, 3 seed, MTR, đối chứng, multi-stage, Tiny-ImageNet, ablation KAN và viết `BAO_CAO.md`.
+Xem `HUONG_DAN_CHAY.md` (đợt 7, máy GPU thuê): `bash scripts/run_fix.sh --dot7` chạy toàn bộ CIFAR-100 + Food-101,
+đối chứng giảm độ phân giải và Δ, Tiny-ImageNet / ImageNet-100 rút gọn, và viết `results_dot7/KET_QUA_DOT7.md`.
 
 ## Quick start
 ```bash

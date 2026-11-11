@@ -3,6 +3,7 @@ throughput (img/s) and peak GPU memory.
 
 fvcore/thop do NOT count the selective scan, so the Vim backbone is counted analytically.
 Check: vim_macs(197, 384, 24) = 5.1 G  (DyVM Table 1 reports 5.08 G for Vim-S)."""
+import contextlib
 import math
 import time
 
@@ -36,7 +37,11 @@ def reducer_macs(reducer, dim, n_tokens=196):
     return fc.get_total_flops() / 2
 
 
-def total_macs(model, dim, depth, n_tokens=196, num_classes=100):
+def total_macs(model, dim, depth, n_tokens=None, num_classes=100):
+    """n_tokens: patch tokens of the patch embedding (patch-embed MACs, reducer input); default: the model's
+    own (196 at 224 px, 100 at 160 px...)."""
+    if n_tokens is None:
+        n_tokens = getattr(model, "n_patches", 196)
     seq = model.layer_tokens() if hasattr(model, "layer_tokens") else [model.reducer.m + 1] * depth
     macs = vim_macs_layers(seq, dim, n_patches=n_tokens, num_classes=num_classes) + reducer_macs(model.reducer, dim, n_tokens)
     for r in getattr(model, "stages", []):
@@ -45,10 +50,11 @@ def total_macs(model, dim, depth, n_tokens=196, num_classes=100):
 
 
 @torch.no_grad()
-def throughput(model, batch=128, iters=30, warmup=10, device="cuda", amp=True):
+def throughput(model, batch=128, iters=30, warmup=10, device="cuda", amp=True, img_size=224):
+    """img_size: the model's own input resolution (no resize is timed)."""
     model.eval().to(device)
-    x = torch.randn(batch, 3, 224, 224, device=device)
-    ctx = torch.autocast(device, dtype=torch.float16, enabled=amp and device == "cuda")
+    x = torch.randn(batch, 3, img_size, img_size, device=device)
+    ctx = torch.autocast(device, dtype=torch.float16) if amp and device == "cuda" else contextlib.nullcontext()
     with ctx:
         for _ in range(warmup):
             model(x)
@@ -63,13 +69,13 @@ def throughput(model, batch=128, iters=30, warmup=10, device="cuda", amp=True):
 
 
 @torch.no_grad()
-def peak_vram_mb(model, batch=128, device="cuda", amp=True):
+def peak_vram_mb(model, batch=128, device="cuda", amp=True, img_size=224):
     if device != "cuda":
         return float("nan")
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     model.eval().to(device)
-    x = torch.randn(batch, 3, 224, 224, device=device)
+    x = torch.randn(batch, 3, img_size, img_size, device=device)
     with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
         model(x)
     torch.cuda.synchronize()

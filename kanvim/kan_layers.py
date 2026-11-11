@@ -3,6 +3,13 @@
 The KAN layer follows FastKAN: B-splines are replaced by Gaussian RBFs, which keeps the
 "learnable 1-D function on every edge" idea of the original KAN but is cheap enough to run
 per token. (KAN paper, Sec. 2.2: phi(x) = w_b * silu(x) + w_s * spline(x).)
+
+Differences from the reference FastKAN layer (write them in the paper):
+  * initialisation: both branches use the default nn.Linear init (Kaiming-uniform, U(-1/sqrt(fan_in), 1/sqrt(fan_in)));
+    FastKAN initialises the RBF ("spline") weights with a small truncated normal (std 0.1) and keeps the base branch;
+  * a LayerNorm before EVERY layer, also before the last one (its input is the hidden width), so the RBF centres
+    (5 Gaussians on [-2, 2], width = grid spacing) see a normalised input; the output logit itself is not normalised;
+  * L1 penalty = mean |RBF weight| x --l1 (1e-4). train.py logs its real share of the loss (log "l1_term" vs "ce").
 """
 import torch
 import torch.nn as nn

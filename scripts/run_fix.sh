@@ -5,4 +5,4 @@
 cd "$(dirname "$0")/.."
 nohup python scripts/run_fix.py "$@" >> run_fix.log 2>&1 &
 echo "Đang chạy nền (PID $!). Xem tiến độ: tail -f $(pwd)/run_fix.log"
-echo "Khi xong: tải file $(pwd)/results_fix.zip về máy."
+echo "Khi log in XONG: tải file zip ghi ở dòng cuối log về máy (--dot7: results_dot7.zip, mặc định: results_fix.zip)."

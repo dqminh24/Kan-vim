@@ -7,15 +7,19 @@ Check it against your checkout of models_mamba.py if you use another variant.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 
 
 class ReducedVim(nn.Module):
     """reducer: applied right after patch embedding (single stage).
     stages: optional [(layer, reducer), ...] for multi-stage reduction; a stage at layer 0 replaces
-    `reducer`, a stage at layer l>0 reduces the residual stream before block l (CLS kept aside)."""
+    `reducer`, a stage at layer l>0 reduces the residual stream before block l (CLS kept aside).
+    img_size: input resolution of the backbone (its patch grid / pos-embed must match). An input of another
+    size (data.py always gives 224) is resized to img_size x img_size right before the patch embedding
+    (bilinear, antialias): the "lower the resolution instead of reducing tokens" control (--img_size)."""
 
-    def __init__(self, backbone, reducer, grad_ckpt=False, stages=None):
+    def __init__(self, backbone, reducer, grad_ckpt=False, stages=None, img_size=None):
         super().__init__()
         self.backbone = backbone
         stages = list(stages or [])
@@ -25,6 +29,18 @@ class ReducedVim(nn.Module):
         self.stage_layers = [l for l, _ in stages]
         self.stages = nn.ModuleList(r for _, r in stages)
         self.grad_ckpt = grad_ckpt  # recompute each block in backward: less VRAM, ~30% slower
+        self.img_size = img_size
+        for l, r in zip(self.stage_layers, self.stages):  # Delta-scored reducer: the block before it exposes Delta
+            if getattr(r, "needs_delta", False):
+                mixer = backbone.layers[l - 1].mixer
+                assert l >= 1 and hasattr(mixer, "record_delta"),                     "delta_prune needs --reduce_at >= 1 and the pure backbone (--impl pure), which exposes Delta"
+                mixer.record_delta = True
+        assert not getattr(reducer, "needs_delta", False), "delta_prune needs --reduce_at >= 1"
+
+    @property
+    def n_patches(self):
+        """Patch tokens produced by the patch embedding (196 at 224 px) = pos-embed rows minus the CLS row."""
+        return self.backbone.pos_embed.shape[1] - 1
 
     def layer_tokens(self):
         """Sequence length (incl. CLS) seen by every block -> GMACs."""
@@ -48,10 +64,16 @@ class ReducedVim(nn.Module):
 
     def forward(self, img):
         b = self.backbone
+        if self.img_size and tuple(img.shape[-2:]) != (self.img_size, self.img_size):
+            img = F.interpolate(img, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False,
+                                antialias=True)
         x = b.patch_embed(img)                       # (B, N, D)
         B, N, D = x.shape
         tp0 = N // 2                                 # original CLS slot in pos_embed
         pos = b.pos_embed
+        assert pos.shape[1] == N + 1, (f"patch embedding gave {N} tokens for a {tuple(img.shape[-2:])} input but "
+                                       f"pos_embed has {pos.shape[1] - 1} patch rows: build the backbone with the "
+                                       f"same img_size")
         x = x + torch.cat([pos[:, :tp0], pos[:, tp0 + 1:]], 1)
         x = self.reducer(x)                          # (B, M, D), order preserved
         M = x.shape[1]
@@ -64,6 +86,9 @@ class ReducedVim(nn.Module):
         stage = dict(zip(self.stage_layers, self.stages))
         for i, layer in enumerate(b.layers):
             if i in stage:
+                if getattr(stage[i], "needs_delta", False):  # Delta of the previous block, CLS slot removed
+                    s = b.layers[i - 1].mixer.last_score
+                    stage[i].score = torch.cat([s[:, :tp], s[:, tp + 1:]], 1)
                 x, tp = self._reduce_mid(x, residual, stage[i], tp)
                 residual = None
             if self.grad_ckpt and self.training:
@@ -87,12 +112,14 @@ class ReducedVim(nn.Module):
         return self.reducer.extra_reg() + sum(r.extra_reg() for r in self.stages)
 
 
-def load_vim(name="tiny", ckpt=None, num_classes=100, impl="pure"):
+def load_vim(name="tiny", ckpt=None, num_classes=100, impl="pure", img_size=224):
     """impl='pure': kanvim.vim_pure (no CUDA build needed, default).
-    impl='official': hustvl/Vim repo on PYTHONPATH + its mamba-ssm / causal-conv1d."""
+    impl='official': hustvl/Vim repo on PYTHONPATH + its mamba-ssm / causal-conv1d.
+    img_size: input resolution (multiple of 16); the 224-px checkpoint's pos-embed is resampled to it."""
+    from .vim_pure import resize_pos_embed
     if impl == "pure":
         from .vim_pure import load_vim_pure
-        return load_vim_pure(name, ckpt, num_classes)
+        return load_vim_pure(name, ckpt, num_classes, img_size)
     import os
     import sys
     import timm
@@ -104,10 +131,15 @@ def load_vim(name="tiny", ckpt=None, num_classes=100, impl="pure"):
     import models_mamba  # noqa: F401  (registers the vim_* models with timm)
     fn = {"tiny": "vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2",
           "small": "vim_small_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2"}[name]
-    model = timm.create_model(fn, pretrained=False, num_classes=1000, img_size=224)
+    assert img_size % 16 == 0, img_size
+    model = timm.create_model(fn, pretrained=False, num_classes=1000, img_size=img_size)
+    grid = (img_size // 16, img_size // 16)  # patch 16, stride 16
+    assert model.pos_embed.shape[1] == grid[0] * grid[1] + 1, (model.pos_embed.shape, grid)
     if ckpt:
         sd = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(sd.get("model", sd), strict=True)
+        sd = dict(sd.get("model", sd))
+        sd["pos_embed"] = resize_pos_embed(sd["pos_embed"], grid)
+        model.load_state_dict(sd, strict=True)
     if num_classes != 1000:  # same as load_vim_pure; VisionMamba has no reset_classifier
         model.head = nn.Linear(model.head.in_features, num_classes)
     return model

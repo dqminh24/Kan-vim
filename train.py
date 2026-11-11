@@ -9,7 +9,7 @@ that model is evaluated on the test set, once. Without --val_size the old behavi
 (test set scored every epoch, last epoch reported).
 """
 import argparse
-import copy
+import contextlib
 import json
 import math
 import os
@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from kanvim import metrics
 from kanvim.kan_layers import count_params
+from kanvim.diagnostics import fmt_stats, reducer_stats, static_spread
 from kanvim.model import ReducedVim, load_vim
 from kanvim.reducers import build_multistage, build_reducer
 from kanvim.vim_pure import VimPure
@@ -30,6 +31,12 @@ from kanvim.vim_pure import VimPure
 DIMS = {"tiny": (192, 24), "small": (384, 24), "stub": (64, 2)}
 PAUSED = 3  # exit code: stopped before --deadline, resume by running the same command again
 AMP_DTYPE = torch.float16  # --bf16 switches autocast to torch.bfloat16
+LOSS_PARTS = {}  # sum over the steps of an epoch of ce / l1_term / kd_term (reset every epoch)
+
+
+def autocast(dev, enabled):
+    """No context at all when AMP is off: torch 2.1 raises on a CPU autocast in float16 even with enabled=False."""
+    return torch.autocast(dev, dtype=AMP_DTYPE) if enabled else contextlib.nullcontext()
 
 
 def seed_all(s):
@@ -49,7 +56,7 @@ def evaluate_full(model, loader, dev, amp):
     loss = 0.0
     for x, y in loader:
         x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
-        with torch.autocast(dev, dtype=AMP_DTYPE, enabled=amp and dev == "cuda"):
+        with autocast(dev, amp and dev == "cuda"):
             out = model(x)
         loss += F.cross_entropy(out.float(), y, reduction="sum").item()
         hit += (out.argmax(1) == y).sum().item()
@@ -79,19 +86,25 @@ def mix_batch(x, y, a):
 
 
 def train_step(model, teacher, x, y, opt, scaler, a, dev, amp, mix=None):
-    with torch.autocast(dev, dtype=AMP_DTYPE, enabled=amp):
-        out = model(x)
+    with autocast(dev, amp):
+        out = model(x)  # --img_size != 224: the model resizes x itself; the teacher below sees the 224 image
+        ls = a.smoothing
         if mix is None:
-            ce = F.cross_entropy(out, y, label_smoothing=0.1)
+            ce = F.cross_entropy(out, y, label_smoothing=ls)
         else:
             ya, yb, lam = mix
-            ce = lam * F.cross_entropy(out, ya, label_smoothing=0.1) + (1 - lam) * F.cross_entropy(out, yb, label_smoothing=0.1)
-        loss = ce + a.l1 * model.reg_loss()
+            ce = lam * F.cross_entropy(out, ya, label_smoothing=ls) + (1 - lam) * F.cross_entropy(out, yb, label_smoothing=ls)
+        reg = a.l1 * model.reg_loss()
+        loss = ce + reg
+        kd = None
         if teacher is not None:
             with torch.no_grad():
                 t = teacher(x)
-            loss = loss + a.distill * F.kl_div(F.log_softmax(out.float(), 1), F.softmax(t.float(), 1),
-                                               reduction="batchmean")
+            kd = a.distill * F.kl_div(F.log_softmax(out.float(), 1), F.softmax(t.float(), 1), reduction="batchmean")
+            loss = loss + kd
+    for k, v in (("ce", ce), ("l1_term", reg), ("kd_term", kd)):  # each term's real share of the loss (logged)
+        if v is not None:
+            LOSS_PARTS[k] = LOSS_PARTS.get(k, 0.0) + torch.as_tensor(v).detach().float()
     opt.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
     if a.clip_grad > 0:
@@ -108,7 +121,7 @@ def probe_stats(model, pruner, x, prev, dev, amp):
     raw_std = std of the scores before the z-score, scorer_norm = L2 norm of the scorer weights,
     flip = fraction of the kept tokens that were not kept at the previous epoch (None at the first one)."""
     model.eval()
-    with torch.autocast(dev, dtype=AMP_DTYPE, enabled=amp and dev == "cuda"):
+    with autocast(dev, amp and dev == "cuda"):
         model(x)
     idx = pruner.aux["idx"]
     kept = torch.zeros(idx.shape[0], pruner.n, device=idx.device).scatter_(1, idx, 1.0)
@@ -141,7 +154,7 @@ def timing(model, teacher, tr, te, opt, scaler, a, dev, amp, warm=5, steps=20, e
     model.eval()
     it_te = _cycle(te)
     t = time.time()
-    with torch.no_grad(), torch.autocast(dev, dtype=AMP_DTYPE, enabled=amp):
+    with torch.no_grad(), autocast(dev, amp):
         for _ in range(eval_batches):
             model(next(it_te)[0].to(dev))
     sync()
@@ -167,6 +180,12 @@ def main():
                     help="block before which the single reducer runs (0 = right after patch embedding). L>0: blocks "
                          "0..L-1 see all 196 tokens, so the scorer sees contextualised tokens (DynamicViT / DyVM)")
     ap.add_argument("--backbone", default="tiny", choices=list(DIMS))
+    ap.add_argument("--img_size", type=int, default=224,
+                    help="input resolution of the model (multiple of 16): (img_size/16)^2 patch tokens, e.g. 192 -> 144, "
+                         "160 -> 100, 112 -> 49. The loaders still give 224 px images (same augmentation for every "
+                         "method); the model resizes them (bilinear, antialias) right before the patch embedding and "
+                         "the checkpoint's 14x14 pos-embed is resampled. The teacher keeps 224. Control for 'why not "
+                         "just lower the resolution': use with --reducer identity")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--epochs", type=int, default=30)
@@ -178,9 +197,16 @@ def main():
     ap.add_argument("--test_subset", type=int, default=0, help=">0: use N test images (pilot runs)")
     ap.add_argument("--val_size", type=int, default=0,
                     help=">0: hold out N train images as validation (model selection / early stopping)")
+    ap.add_argument("--val_from", default="train", choices=["train", "test"],
+                    help="with --val_size: train = hold out --val_size train images (default); test = split the official "
+                         "test set in two stratified halves, val / test (ImageNet-100: its train images are in the "
+                         "ImageNet-1K pretraining set, a val taken from them is contaminated)")
     ap.add_argument("--patience", type=int, default=0, help=">0: early stop after N epochs without val improvement")
-    ap.add_argument("--mixup", type=float, default=0.0, help="mixup alpha (0 = off)")
+    ap.add_argument("--mixup", type=float, default=0.0,
+                    help="mixup alpha (0 = off; scripts/run_fix.py uses 0.2). Done here in the training loop on whole "
+                         "batches (mix_batch), not in kanvim/data.py")
     ap.add_argument("--cutmix", type=float, default=0.0, help="cutmix alpha (0 = off)")
+    ap.add_argument("--smoothing", type=float, default=0.1, help="label smoothing of the cross-entropy")
     ap.add_argument("--clip_grad", type=float, default=0.0, help=">0: clip gradient norm")
     ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--wd_exclude", action="store_true",
@@ -233,50 +259,74 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     amp = dev == "cuda"
     dim, depth = DIMS[a.backbone]
+    from kanvim.data import PIPELINE_SIZE, data_config, format_transform
+    assert a.img_size % 16 == 0, f"--img_size {a.img_size} must be a multiple of the patch size 16"
+    grid = (a.img_size // 16, a.img_size // 16)
+    n_tok = grid[0] * grid[1]
+    if a.img_size != PIPELINE_SIZE and f"res{a.img_size}" not in a.tag.split("_"):
+        a.tag = "_".join(t for t in (a.tag, f"res{a.img_size}") if t)  # never overwrite the 224 px result file
 
     va = None
     if a.smoke:
         from torch.utils.data import DataLoader, TensorDataset
-        ds = TensorDataset(torch.randn(16, 3, 224, 224), torch.randint(0, 10, (16,)))
+        ds = TensorDataset(torch.randn(16, 3, PIPELINE_SIZE, PIPELINE_SIZE), torch.randint(0, 10, (16,)))
         tr = te = DataLoader(ds, 8)
         nc = 10
     elif a.val_size > 0:
         from kanvim.data import build_loaders_val
         tr, va, te, nc = build_loaders_val(a.dataset, a.data_root, a.batch, a.workers, a.val_size,
-                                           a.train_subset, a.test_subset)
+                                           a.train_subset, a.test_subset, a.val_from)
         print(f"data: train {len(tr.dataset)} | val {len(va.dataset)} | test {len(te.dataset)}", flush=True)
     else:
         from kanvim.data import build_loaders
         tr, te, nc = build_loaders(a.dataset, a.data_root, a.batch, a.workers, a.train_subset, a.test_subset)
+    data_cfg = data_config("smoke" if a.smoke else a.dataset, tr, va, te, nc)
+    for k, v in data_cfg["transform"].items():
+        print(f"transform {k}: {format_transform(v)}", flush=True)
 
-    backbone = VimPure(dim, depth, nc) if a.backbone == "stub" else load_vim(a.backbone, a.ckpt, nc, a.impl)
+    def make_backbone(img_size, ckpt):
+        if a.backbone == "stub":
+            return VimPure(dim, depth, nc, img=img_size)
+        return load_vim(a.backbone, ckpt, nc, a.impl, img_size=img_size)
+
+    backbone = make_backbone(a.img_size, a.ckpt)
     if a.reducer.endswith("_ms"):  # multi-stage pruning (DyVM-style), same mean tokens as single stage
-        model = ReducedVim(backbone, None, grad_ckpt=a.grad_ckpt,
-                           stages=build_multistage(a.reducer, dim, a.ratio, depth, a.kan_hidden, a.grid_size,
+        model = ReducedVim(backbone, None, grad_ckpt=a.grad_ckpt, img_size=a.img_size,
+                           stages=build_multistage(a.reducer, dim, a.ratio, depth, a.kan_hidden, a.grid_size, n=n_tok,
                                                    prune_mode=a.prune_mode, prune_temp=a.prune_temp,
                                                    prune_norm=a.prune_norm)).to(dev)
     else:
-        red = build_reducer(a.reducer, dim, (14, 14), a.ratio, a.kan_hidden, a.grid_size,
+        red = build_reducer(a.reducer, dim, grid, a.ratio, a.kan_hidden, a.grid_size,
                             a.prune_mode, a.prune_temp, a.prune_norm, a.prune_cover)
         if a.reduce_at > 0:  # identity at the input, the reducer on the residual stream before block reduce_at
             assert a.reduce_at < depth, (a.reduce_at, depth)
-            model = ReducedVim(backbone, build_reducer("identity", dim, (14, 14), 1.0), grad_ckpt=a.grad_ckpt,
-                               stages=[(a.reduce_at, red)]).to(dev)
+            model = ReducedVim(backbone, build_reducer("identity", dim, grid, 1.0), grad_ckpt=a.grad_ckpt,
+                               stages=[(a.reduce_at, red)], img_size=a.img_size).to(dev)
         else:
-            model = ReducedVim(backbone, red, grad_ckpt=a.grad_ckpt).to(dev)
+            model = ReducedVim(backbone, red, grad_ckpt=a.grad_ckpt, img_size=a.img_size).to(dev)
+    assert model.n_patches == n_tok, (model.n_patches, n_tok)
     pruners = [r for r in [model.reducer, *model.stages] if hasattr(r, "noise")]
-    reducer = model.reducer
     red_params = lambda: sum(p.numel() for p in model.reducer.parameters()) + sum(p.numel() for p in model.stages.parameters())
-    teacher = None
-    if a.distill > 0 and a.reducer != "identity" and a.teacher_ckpt:
-        tb = copy.deepcopy(backbone)
-        teacher = ReducedVim(tb, build_reducer("identity", dim, (14, 14), 1.0))
-        teacher.load_state_dict(torch.load(a.teacher_ckpt, map_location="cpu"))
+    # distillation: every model that sees fewer than the 196 tokens of the 224 px baseline (a reducer, or a lower
+    # --img_size) learns from the un-reduced baseline; the teacher keeps its own resolution (read from its pos-embed)
+    teacher, t_size = None, None
+    if a.distill > 0 and a.teacher_ckpt and (a.reducer != "identity" or a.img_size != PIPELINE_SIZE):
+        sd = torch.load(a.teacher_ckpt, map_location="cpu")
+        t_grid = math.isqrt(sd["backbone.pos_embed"].shape[1] - 1)
+        t_size = 16 * t_grid
+        with torch.random.fork_rng(devices=[]):  # the random init (overwritten below) must not shift the run's RNG
+            tb = make_backbone(t_size, None)     # stream: same data order / mixup / noise as the former deepcopy
+        teacher = ReducedVim(tb, build_reducer("identity", dim, (t_grid, t_grid), 1.0), img_size=t_size)
+        teacher.load_state_dict(sd)
+        del sd
         teacher = teacher.to(dev).eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
+    print(f"input: loaders {PIPELINE_SIZE} px -> model {a.img_size} px = {n_tok} patch tokens"
+          + (f" (resized in the model, pos-embed 14x14 -> {grid[0]}x{grid[1]})" if a.img_size != PIPELINE_SIZE else ""),
+          flush=True)
     print(f"reducer={a.reducer} tokens per block={sorted(set(model.layer_tokens()), reverse=True)}, reducer params={red_params()}, "
-          f"distill={'on' if teacher else 'off'}", flush=True)
+          f"distill={'on (teacher ' + str(t_size) + ' px)' if teacher else 'off'}", flush=True)
 
     head_ids = {id(p) for p in model.backbone.head.parameters()}
     body = [(n, p) for n, p in model.backbone.named_parameters() if id(p) not in head_ids]
@@ -321,8 +371,29 @@ def main():
     if pruners and a.freeze_reducer > 0:
         freeze_ep = min(a.epochs - 1, max(1, round(a.epochs * (1 - a.freeze_reducer))))
     probe_x = next(iter(va if va is not None else te))[0][:64].to(dev) if pruners else None
+    # diagnostics (kanvim.diagnostics): learned pools (are the merge weights more than an average?) and pruners
+    # (where the kept tokens lie). Probe images read straight from the dataset: no DataLoader iterator, so the RNG
+    # stream of the run is the same as before these logs existed.
+    diag = next((r for r in [model.reducer, *model.stages] if getattr(r, "scorer", None) is not None
+                 or getattr(r, "kind", None) == "avg" or getattr(r, "needs_delta", False)), None)
+    if diag is not None and diag.n != n_tok:
+        diag = None  # a later multi-stage reducer: its input is no longer the patch grid
+    if diag is not None and probe_x is None:
+        pds = va.dataset if va is not None else te.dataset
+        probe_x = torch.stack([pds[i][0] for i in range(min(64, len(pds)))]).to(dev)
+
+    @torch.no_grad()
+    def diag_stats():
+        if diag is None:
+            return {}
+        if not pruners:  # probe_stats already ran this forward for the pruners
+            model.eval()
+            with autocast(dev, amp and dev == "cuda"):
+                model(probe_x)
+        return reducer_stats(diag, grid)
     probe_prev = None
     stopped = "completed"
+    seen = {}  # shape of the first training batch as it leaves the loader (written into the json)
     for ep in range(start_ep, a.epochs):
         if a.patience and bad >= a.patience:
             stopped = f"early stop @ epoch {ep - 1}"
@@ -339,10 +410,13 @@ def main():
                 r.requires_grad_(False)
         t0 = time.time()
         loss_sum = hit = n = 0
+        LOSS_PARTS.clear()
+        n_steps = 0
         for it, (x, y) in enumerate(tr):
             if it >= per_epoch:
                 break
             x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
+            seen.setdefault("train_batch", list(x.shape))
             x, mix = mix_batch(x, y, a)
             for r in pruners:  # st: Gumbel noise a.gumbel -> 0 at freeze_ep (default: end); legacy: fixed (first version)
                 r.noise = a.gumbel * max(0.0, 1 - (ep * per_epoch + it) / (freeze_ep * per_epoch)) \
@@ -350,6 +424,7 @@ def main():
             loss, out = train_step(model, teacher, x, y, opt, scaler, a, dev, amp, mix)
             sched.step()
             loss_sum += loss.item() * y.numel()
+            n_steps += 1
             hit += (out.argmax(1) == y).sum().item()
             n += y.numel()
         t_train = time.time() - t0
@@ -357,9 +432,12 @@ def main():
         rec = {"epoch": ep, "loss": loss_sum / n, "train_loss": loss_sum / n, "train_top1": 100.0 * hit / n,
                "top1": acc, "val_loss": eval_loss, "lr": sched.get_last_lr()[0],
                "train_min": t_train / 60, "total_min": (time.time() - t0) / 60}
+        rec.update({k: v.item() / max(n_steps, 1) for k, v in LOSS_PARTS.items()})
         if pruners:
             stats, probe_prev = probe_stats(model, pruners[0], probe_x, probe_prev, dev, amp)
             rec.update(stats)
+        diag_now = diag_stats()
+        rec.update(diag_now)
         log.append(rec)
         if acc > best["val_top1"]:
             best, bad = {"val_top1": acc, "epoch": ep}, 0
@@ -375,7 +453,8 @@ def main():
               f"train+eval {rec['total_min']:.1f} min"
               + (f" | raw_std {rec['raw_std']:.3g} scorer_norm {rec['scorer_norm']:.3g} flip "
                  + ("-" if rec["flip"] is None else f"{rec['flip']:.3f}") + (" (frozen)" if ep >= freeze_ep else "")
-                 if pruners else ""), flush=True)
+                 if pruners else "")
+              + (f" | {fmt_stats(diag_now)}" if diag_now else ""), flush=True)
         if last_pt:
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                         "scaler": scaler.state_dict(), "epoch": ep, "log": log, "bad": bad, "best": best,
@@ -388,6 +467,10 @@ def main():
             best_state = torch.load(best_pt, map_location="cpu")
         model.load_state_dict(best_state)
         res.update(val_top1=best["val_top1"], best_epoch=best["epoch"])
+        if diag is not None:  # diagnostics of the model that is kept (best val), not of the last epoch
+            if pruners:
+                probe_stats(model, pruners[0], probe_x, None, dev, amp)
+            res["diagnostics"] = diag_stats()
         if a.no_test:
             res["top1"] = None
         else:
@@ -400,16 +483,40 @@ def main():
 
     res.update(params_M=count_params(model) / 1e6,
                reducer_params=red_params(), mean_tokens=sum(model.layer_tokens()) / depth - 1,
-               GMACs=metrics.total_macs(model.cpu(), dim, depth, num_classes=nc) / 1e9)
+               GMACs=metrics.total_macs(model.cpu(), dim, depth, n_tokens=n_tok, num_classes=nc) / 1e9)
     model.to(dev)
     res["scan_impl"] = a.impl if a.backbone != "stub" else "stub"
+    if "gap" in res.get("diagnostics", {}):  # pruners: where Static Drop would put the kept tokens, as reference
+        res.setdefault("diagnostics", {})["static_drop_ref"] = static_spread(n_tok, a.ratio, grid)
+    # how the data reached the model: transforms / sizes read back from the loaders and the model actually used;
+    # the resize / pos-embed lines describe the code path taken for img_size != 224
+    res["data"] = {**data_cfg, "train_batch_seen": seen.get("train_batch")}
+    res["model_input"] = {
+        "img_size": a.img_size, "patch": 16, "grid": list(grid), "patch_tokens": model.n_patches,
+        "resize_in_model": None if a.img_size == PIPELINE_SIZE else
+        f"{PIPELINE_SIZE} -> {a.img_size}: F.interpolate bilinear, align_corners=False, antialias=True "
+        "(ReducedVim.forward, before the patch embedding; train, val and test)",
+        "pos_embed": None if a.img_size == PIPELINE_SIZE else
+        f"checkpoint 14x14 -> {grid[0]}x{grid[1]}: F.interpolate bicubic, align_corners=False, antialias=True; "
+        "CLS row kept in the middle (vim_pure.resize_pos_embed)"}
+    res["train_recipe"] = {
+        "mixup_alpha": a.mixup, "cutmix_alpha": a.cutmix,
+        "batch_mixing": "train.py mix_batch, after the data.py transforms: one lambda ~ Beta(alpha, alpha) per batch, "
+                        "x = lam*x + (1-lam)*x[perm], loss = lam*CE(y) + (1-lam)*CE(y[perm])"
+                        if a.mixup > 0 or a.cutmix > 0 else None,
+        "label_smoothing": a.smoothing, "distill": teacher is not None,
+        "distill_weight": a.distill if teacher is not None else 0.0,
+        "teacher_ckpt": a.teacher_ckpt if teacher is not None else None, "teacher_img_size": t_size}
+    import torchvision
+    res["env"] = {"torch": torch.__version__, "torchvision": torchvision.__version__, "cuda": torch.version.cuda,
+                  "gpu": torch.cuda.get_device_name(0) if dev == "cuda" else "cpu"}
     if dev == "cuda" and not a.no_bench:
-        res["throughput"] = metrics.throughput(model, batch=64)
-        res["vram_MB"] = metrics.peak_vram_mb(model, batch=64)
+        res["throughput"] = metrics.throughput(model, batch=64, img_size=a.img_size)
+        res["vram_MB"] = metrics.peak_vram_mb(model, batch=64, img_size=a.img_size)
     os.makedirs(a.out, exist_ok=True)
     name = f"{a.dataset}_{a.backbone}_{a.reducer}_r{a.ratio}_s{a.seed}{'_' + a.tag if a.tag else ''}.json"
     json.dump(res, open(os.path.join(a.out, name), "w"), indent=1)
-    print("saved", name, {k: v for k, v in res.items() if k not in ("log", "args")})
+    print("saved", name, {k: v for k, v in res.items() if k not in ("log", "args", "data", "model_input", "train_recipe", "env")})
     for p in (last_pt, best_pt):  # finished: the json is the result, drop the resume state
         if p and os.path.exists(p):
             os.remove(p)

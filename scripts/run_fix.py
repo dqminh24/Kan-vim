@@ -37,10 +37,29 @@ Kết quả: results_fix/*.json, bảng so sánh results_fix/KET_QUA_FIX.md, log
          MLP Prune x giữ 75 / 50 / 25% x 3 seed (seed 0 của mọi mức chạy trước).
          16 job giữ 50% đã có (results_lr, cùng cấu hình) nằm ở prev_results/lr5e-5/, được chép vào --out: không chạy lại.
          Cùng pha: baseline Tiny-ImageNet và ImageNet-100 (seed 0, --ext_epochs epoch), lưu làm teacher.
-  Pha 2. Tiny-ImageNet, ImageNet-100 rút gọn: 6 phương pháp, giữ 50%, seed 0, chưng cất từ teacher cùng dataset;
-         sau cùng là phần phụ Static Drop giữ 75% / 25% x 3 seed trên CIFAR-100.
+  Pha 2. Tiny-ImageNet, ImageNet-100 rút gọn: 6 phương pháp + Static Drop, giữ 50%, seed 0, chưng cất từ teacher cùng
+         dataset; sau cùng là phần phụ Static Drop giữ 75% / 25% x 3 seed trên CIFAR-100.
          Thiếu data/imagenet-100 (scripts/prep_imagenet100.py) thì bỏ qua phần ImageNet-100.
   Bảng: <out>/KET_QUA_DOT6.md, hình: <out>/fig_dot6_cifar100.png
+
+Đợt 7 (--dot7, --out mặc định results_dot7): hai tập chính CIFAR-100 + Food-101, cùng cấu hình đợt 6 (giảm ở đầu vào,
+lr backbone 5e-5, --prune_norm, patience 0, mixup 0,2, chưng cất từ baseline 100% token cùng dataset).
+  Đối chứng giảm độ phân giải (--img_size 192 / 160 / 112 = 144 / 100 / 49 token ~ giữ 75 / 50 / 25%): Vim-Ti không
+  có bộ giảm token, ảnh 224 được thu nhỏ ngay trước patch embedding, pos-embed nội suy từ lưới 14x14; có chưng cất
+  (teacher vẫn nhìn ảnh 224) như mọi phương pháp giảm token.
+  Pha 1. baseline Food-101 seed 0 (lưu làm teacher), baseline ImageNet-100 làm lại (teacher mới), Static Drop
+         Tiny-ImageNet (giữ 50%, seed 0, --ext_epochs epoch, teacher của đợt 6), giảm độ phân giải CIFAR-100 seed 0.
+         ImageNet-100 làm lại cả 8 job (baseline + 7 phương pháp, giữ 50%, seed 0) với --val_from test: val / test =
+         hai nửa val chính thức (đợt 6 lấy val từ ảnh train, vốn nằm trong tập pretrain ImageNet-1K), tag lr5e-5_valtest.
+  Pha 2. Food-101 (--food_epochs epoch, quy trình ảnh của ImageNet): KANPool, MLP Pool, Avg Pool, Max Pool, KAN Prune,
+         MLP Prune, Static Drop x giữ 75 / 50 / 25% + giảm độ phân giải x 3 kích thước, theo seed: seed 0 mọi job
+         trước, rồi baseline Food-101 seed 1/2 và CIFAR-100 giảm độ phân giải seed 1/2, rồi seed 1, rồi seed 2.
+  Đối chứng Δ (delta_prune: chọn token bằng Δ của Mamba, không học): CIFAR-100, sau khối 6, giữ 50% / 25%, 3 seed, bản
+  pure; mốc ghép cặp là các đợt ctx / r25 (L6_REF).
+  Kết quả đợt 6 (json + teacher_tiny-imagenet.pt / teacher_imagenet-100.pt) được chép từ --dot6_dir (mặc định
+  results_dot6/: giải nén results_dot6.zip vào đó) để so trong cùng bảng; thiếu thì bảng CIFAR-100 chỉ có giảm độ
+  phân giải và Static Drop Tiny-ImageNet bị bỏ qua.
+  Bảng: <out>/KET_QUA_DOT7.md (có cả cấu hình biến đổi ảnh đọc lại từ json), hình: <out>/fig_dot7_<dataset>.png
 """
 import argparse
 import glob
@@ -165,6 +184,7 @@ DOT6_RATIOS = (0.75, 0.5, 0.25)
 DOT6_NAMES = {**LR_NAMES, "identity": "Vim-Ti (100% token)", "avg_pool": "Avg Pool", "max_pool": "Max Pool"}
 DOT6_PREV = os.path.join(ROOT, "prev_results", "lr5e-5")  # 16 job giữ 50% của results_lr, cùng cấu hình
 DOT6_EXT = {"tiny-imagenet": "Tiny-ImageNet", "imagenet-100": "ImageNet-100"}
+EXT_METHODS = DOT6_METHODS + ["static_drop"]  # Tiny-ImageNet / ImageNet-100: Static Drop is the strongest CIFAR control
 # (a, b, tên): hiệu số a − b ghép cặp theo seed ở từng mức giữ
 DOT6_PAIRS = [("kan_pool", "kan_prune", "Gộp − loại bỏ (KAN)"), ("mlp_pool", "mlp_prune", "Gộp − loại bỏ (MLP)"),
               ("kan_pool", "mlp_pool", "KAN − MLP (gộp)"), ("kan_prune", "mlp_prune", "KAN − MLP (loại bỏ)"),
@@ -185,12 +205,82 @@ def jobs_dot6(a):
     teachers = [("identity", 1.0, 0, DOT6_TAG, ext + ["--save_ckpt", ext_teacher(a, ds)], ds) for ds in a.ext_ds]
     static = [("static_drop", ratio, s, DOT6_TAG, lr) for s in (0, 1, 2) for ratio in (0.75, 0.25)]
     rest = [(r, 0.5, 0, DOT6_TAG, ext + ["--teacher_ckpt", ext_teacher(a, ds)], ds)
-            for ds in a.ext_ds for r in DOT6_METHODS]
+            for ds in a.ext_ds for r in EXT_METHODS]
     if a.quick:  # chạy thử: đủ mọi loại job (baseline, gộp, loại bỏ, teacher, mỗi dataset) nhưng ít job
         keep = {("identity", 1.0, 0), ("kan_pool", 0.25, 0), ("max_pool", 0.75, 0), ("kan_prune", 0.25, 0)}
         return [[j for j in cifar if j[:3] in keep] + teachers, [j for j in rest if j[0] in ("kan_pool", "kan_prune")]]
     # pha 1: baseline + seed 0 mọi mức (đủ một đường cong sớm), teacher, seed 1/2. Static Drop là phần phụ: cuối pha 2
     return [cifar[:21] + teachers + cifar[21:], rest + static]
+
+
+# --dot7: hai tập chính (CIFAR-100, Food-101) + đối chứng giảm độ phân giải. Cùng tag / cấu hình với --dot6.
+SEEDS = (0, 1, 2)
+DOT7_SIZES = (192, 160, 112)                       # 144 / 100 / 49 patch token
+DOT7_SIZE_OF = dict(zip(DOT6_RATIOS, DOT7_SIZES))  # cột "giữ 75 / 50 / 25%" của bảng -> kích thước ảnh cùng cột
+DOT7_MAIN = {"cifar100": "CIFAR-100", "food101": "Food-101"}
+DOT7_METHODS = EXT_METHODS                         # 7 phương pháp như bảng CIFAR-100 của đợt 6
+LOWRES = "lowres"                                  # hàng "giảm độ phân giải" trong bảng (job: identity + --img_size)
+DOT7_NAMES = {**DOT6_NAMES, LOWRES: "Giảm độ phân giải"}
+# (phương pháp − giảm độ phân giải cùng cột), ghép cặp theo seed
+DOT7_LOWRES_PAIRS = ["kan_pool", "kan_prune", "mlp_pool", "static_drop"]
+
+
+IN100_TAG = f"{DOT6_TAG}_valtest"  # ImageNet-100 làm lại: val / test = hai nửa val chính thức (--val_from test)
+
+
+def res_tag(size):
+    return f"{DOT6_TAG}_res{size}"
+
+
+# Đối chứng Δ: chọn token bằng Δ có sẵn của Mamba (không học) ở đúng vị trí / mức giữ của các đợt ctx / r25 (sau khối 6,
+# CIFAR-100, 3 seed). Mốc ghép cặp theo seed lấy từ results_ctx (giữ 50%) và results_r25 (giữ 25%), cùng cấu hình.
+DELTA_METHODS = ["delta_prune"]
+DELTA_TAG = "L6_lr5e-5"
+L6_REF = {0.5: {"kan_pool": [87.37, 87.46, 87.30], "mlp_pool": [87.26, 87.35, 87.67], "static_drop": [87.41, 86.66, 87.27],
+                "kan_prune": [82.76, 82.98, 81.18], "mlp_prune": [82.42, 82.39, 82.43]},
+          0.25: {"kan_pool": [85.59, 85.68, 85.51], "mlp_pool": [85.58, 85.69, 85.71], "static_drop": [85.34, 84.86, 84.96],
+                 "avg_pool": [85.14, 85.32, 85.14], "kan_prune": [82.96, 82.94, 83.03], "mlp_prune": [83.13, 82.96, 83.11]}}
+L6_NAMES = {**DOT6_NAMES, "delta_prune": "Δ Prune (giữ Δ lớn)", "delta_prune_low": "Δ Prune (giữ Δ nhỏ)"}
+
+
+def in100_teacher(a):
+    return os.path.join(a.out, "teacher_imagenet-100_valtest.pt")
+
+
+def jobs_dot7(a):
+    """-> [pha 1, pha 2]. Pha 2 (Food-101 có chưng cất) cần teacher_food101.pt do pha 1 lưu."""
+    lr = ["--lr", "5e-5"]
+    food = lr + ["--epochs", str(a.food_epochs)]
+    ext = lr + ["--epochs", str(a.ext_epochs)]
+    teach = lambda ds: ["--teacher_ckpt", ext_teacher(a, ds)]
+    size = lambda z: ["--img_size", str(z)]
+    food_base = [("identity", 1.0, s, DOT6_TAG, food + (["--save_ckpt", ext_teacher(a, "food101")] if s == 0 else []),
+                  "food101") for s in SEEDS]
+    # CIFAR-100: teacher = --teacher (teacher_cifar100.pt), như mọi job CIFAR-100 của đợt 6
+    cifar_res = [("identity", 1.0, s, res_tag(z), lr + size(z)) for s in SEEDS for z in DOT7_SIZES]
+    ext_sd = [("static_drop", 0.5, 0, DOT6_TAG, ext + teach(ds), ds) for ds in a.ext_ds if ds != "imagenet-100"]
+    # ImageNet-100 làm lại cả 8 job với val sạch (val đợt 6 tách từ train = ảnh pretrain ImageNet-1K)
+    vt = ext + ["--val_from", "test"]
+    in100 = "imagenet-100" in a.ext_ds
+    in_base = [("identity", 1.0, 0, IN100_TAG, vt + ["--save_ckpt", in100_teacher(a)], "imagenet-100")] if in100 else []
+    in_rest = [(r, 0.5, 0, IN100_TAG, vt + ["--teacher_ckpt", in100_teacher(a)], "imagenet-100")
+               for r in EXT_METHODS] if in100 else []
+
+    def food_seed(s):
+        return ([(r, ratio, s, DOT6_TAG, food + teach("food101"), "food101") for ratio in DOT6_RATIOS for r in DOT7_METHODS]
+                + [("identity", 1.0, s, res_tag(z), food + size(z) + teach("food101"), "food101") for z in DOT7_SIZES])
+
+    # CIFAR-100, sau khối 6, bản pure (backbone chính thức không cho đọc Δ); seed 0 trước
+    delta = [(r, q, s, DELTA_TAG, lr + ["--reduce_at", "6", "--impl", "pure"]) for s in SEEDS for q in (0.5, 0.25)
+             for r in DELTA_METHODS]
+    n = len(DOT7_SIZES)
+    if a.quick:  # chạy thử: mỗi loại job một lần (teacher, chưng cất, gộp, loại bỏ, Static Drop, giảm độ phân giải)
+        keep = {("kan_pool", 0.25, DOT6_TAG), ("kan_prune", 0.5, DOT6_TAG), ("static_drop", 0.5, DOT6_TAG),
+                ("identity", 1.0, res_tag(160))}
+        return [food_base[:1] + in_base + ext_sd + [j for j in cifar_res[:n] if j[3] == res_tag(112)],
+                [j for j in food_seed(0) if (j[0], j[1], j[3]) in keep] + in_rest[-1:] + delta[:1]]
+    return [food_base[:1] + in_base + ext_sd + cifar_res[:n],
+            in_rest + delta + food_seed(0) + food_base[1:] + cifar_res[n:] + food_seed(1) + food_seed(2)]
 
 
 def result_name(r, ratio, seed, tag, dataset="cifar100"):
@@ -200,8 +290,9 @@ def result_name(r, ratio, seed, tag, dataset="cifar100"):
 def done(a, j):
     if not os.path.exists(os.path.join(a.out, result_name(*j[:4], *j[5:]))):
         return False
-    extra = j[4]  # teacher của --dot6: phải có cả file checkpoint
-    return not (a.dot6 and "--save_ckpt" in extra and not os.path.exists(extra[extra.index("--save_ckpt") + 1]))
+    extra = j[4]  # teacher của --dot6 / --dot7: phải có cả file checkpoint
+    return not ((a.dot6 or a.dot7) and "--save_ckpt" in extra
+                and not os.path.exists(extra[extra.index("--save_ckpt") + 1]))
 
 
 def log(msg):
@@ -228,6 +319,8 @@ def prepare(a):
         for f in glob.glob(os.path.join(DOT6_PREV, "*.json")):
             if not os.path.exists(os.path.join(a.out, os.path.basename(f))):
                 shutil.copy(f, a.out)
+    if a.dot7:
+        prepare_dot7(a, build_datasets)
     if a.impl == "auto":
         r = subprocess.run([PY, os.path.join(ROOT, "scripts", "check_impl.py"), a.ckpt], cwd=ROOT,
                            capture_output=True, text=True)
@@ -238,6 +331,40 @@ def prepare(a):
     log(f"backbone implementation: {a.impl}")
 
 
+def prepare_dot7(a, build_datasets):
+    log("tải Food-101 (một lần, ~5 GB)")
+    build_datasets("food101", a.data_root)
+    os.makedirs(a.out, exist_ok=True)
+    nested = os.path.join(a.dot6_dir, "results_dot6")  # zip giải nén "vào" thư mục results_dot6 -> lồng 2 cấp
+    if not glob.glob(os.path.join(a.dot6_dir, "*.json")) and os.path.isdir(nested):
+        a.dot6_dir = nested
+    if os.path.isdir(a.dot6_dir) and not glob.glob(os.path.join(a.dot6_dir, "*.json")):
+        log(f"CẢNH BÁO: {a.dot6_dir} không có json nào của đợt 6 (giải nén sai chỗ?)")
+    if os.path.isdir(a.dot6_dir) and os.path.abspath(a.dot6_dir) != os.path.abspath(a.out):
+        # ImageNet-100 chạy lại từ đầu (teacher mới, val sạch): chỉ cần teacher Tiny-ImageNet của đợt 6
+        src = glob.glob(os.path.join(a.dot6_dir, "*.json")) + [os.path.join(a.dot6_dir, "teacher_tiny-imagenet.pt")]
+        new = [f for f in src if os.path.exists(f) and not os.path.exists(os.path.join(a.out, os.path.basename(f)))]
+        for f in new:
+            shutil.copy(f, a.out)
+        log(f"chép {len(new)} file (json + teacher Tiny-ImageNet) của đợt 6 từ {a.dot6_dir}")
+    elif not os.path.isdir(a.dot6_dir):
+        log(f"CẢNH BÁO: không thấy {a.dot6_dir} (giải nén results_dot6.zip vào đó): bảng CIFAR-100 sẽ thiếu các phương "
+            "pháp giảm token để so với giảm độ phân giải, Static Drop Tiny-ImageNet bị bỏ qua (thiếu teacher)")
+    a.ext_ds = []
+    for ds in DOT6_EXT:
+        if ds == "imagenet-100" and not os.path.isdir(os.path.join(a.data_root, "imagenet-100", "train")):
+            log(f"CẢNH BÁO: chưa có {a.data_root}/imagenet-100 (xem scripts/prep_imagenet100.py) -> bỏ qua 8 job "
+                "ImageNet-100")
+            continue
+        # thiếu teacher: job vẫn nằm trong danh sách, cuối đợt báo lỗi "chưa có teacher"
+        if ds == "tiny-imagenet" and not os.path.exists(ext_teacher(a, ds)):
+            log(f"CẢNH BÁO: thiếu {ext_teacher(a, ds)} (teacher của đợt 6) -> Static Drop {ds} sẽ bị bỏ qua")
+        elif ds == "tiny-imagenet":
+            log("tải Tiny-ImageNet (một lần, ~250 MB)")
+            build_datasets("tiny-imagenet", a.data_root)
+        a.ext_ds.append(ds)
+
+
 def command(a, r, ratio, seed, tag, extra, dataset="cifar100"):
     name = os.path.splitext(result_name(r, ratio, seed, tag, dataset))[0]
     cmd = [PY, os.path.join(ROOT, "train.py"), "--dataset", dataset, "--data_root", a.data_root,
@@ -246,8 +373,8 @@ def command(a, r, ratio, seed, tag, extra, dataset="cifar100"):
            "--epochs", "30", "--patience", str(a.patience), "--lr", "1e-4", "--teacher_ckpt", a.teacher,
            "--reducer", r, "--ratio", str(ratio), "--seed", str(seed), "--prune_mode", "st",
            "--out", a.out, "--resume_dir", os.path.join(a.out, "state", name)] + (["--prune_norm"] if a.prune_norm else []) + extra
-    if a.quick:  # vài bước mỗi epoch: chỉ để bắt lỗi trước khi chạy thật
-        cmd += ["--epochs", "2", "--max_steps", "20", "--no_bench"]
+    if a.quick:  # vài bước mỗi epoch: chỉ để bắt lỗi trước khi chạy thật (giảm độ phân giải: thử cả đo tốc độ ở ảnh nhỏ)
+        cmd += ["--epochs", "2", "--max_steps", "20"] + ([] if "--img_size" in extra else ["--no_bench"])
     if tag:
         cmd += ["--tag", tag]
     return name, cmd
@@ -257,6 +384,8 @@ def job_phases(a):
     """Các pha chạy lần lượt; trong một pha, mỗi GPU lấy job tiếp theo trong hàng đợi."""
     if a.dot6:
         return jobs_dot6(a)
+    if a.dot7:
+        return jobs_dot7(a)
     return [jobs_r25(a) if a.r25_round else jobs_ctx(a) if a.ctx_round else jobs_stab() if a.stab_round
             else jobs_lr() if a.lr_round else jobs()]
 
@@ -304,7 +433,7 @@ def run_phase(a, gpus, todo, failed):
                 f"({(time.time() - t) / 60:.0f} phút)")
             if rc:
                 failed.append(name)
-            report(a)
+            safe_report(a)
 
     ts = [threading.Thread(target=worker, args=(g,)) for g in gpus]
     for t in ts:
@@ -349,9 +478,24 @@ def load_results(out, with_ds=False):
     return res
 
 
+REPORT_LOCK = threading.Lock()
+
+
+def safe_report(a):
+    """Bảng được viết lại sau mỗi job, từ luồng của từng GPU: một luồng một lúc (matplotlib không an toàn đa luồng),
+    và lỗi khi viết bảng không được làm dừng hàng đợi job."""
+    with REPORT_LOCK:
+        try:
+            report(a)
+        except Exception as e:  # noqa: BLE001
+            log(f"CẢNH BÁO: lỗi khi viết bảng ({e!r}); các job vẫn chạy tiếp")
+
+
 def report(a):
     if a.dot6:
         return report_dot6(a)
+    if a.dot7:
+        return report_dot7(a)
     res = load_results(a.out)
     if a.r25_round:
         return report_r25(a, res)
@@ -509,7 +653,7 @@ def report_dot6(a):
          "Cấu hình chung: Vim-Ti pretrain ImageNet-1K, lr backbone 5e-5, lr head và bộ chấm điểm 1e-3, Prune st + "
          "--prune_norm, mixup 0,2, chưng cất từ baseline cùng dataset, chọn mô hình theo val, test dùng 1 lần. "
          "Baseline không chưng cất.", "",
-         f"## CIFAR-100 (30 epoch, 3 seed)", "",
+         "## CIFAR-100 (30 epoch, 3 seed)", "",
          f"Baseline Vim-Ti (100% token, 1,47 GMACs): **{fmt(base)}** (n={len(base)}).", "",
          "Test top-1 (%), trung bình ± độ lệch; trong ngoặc: chênh so với trung bình baseline. "
          "n < 3 = chưa đủ seed. Static Drop giữ 50% lấy từ results_lr.", "",
@@ -554,7 +698,7 @@ def report_dot6(a):
               "| Phương pháp | Test top-1 (%) | Chênh so với baseline | Epoch tốt nhất |", "|---|---|---|---|",
               f"| {DOT6_NAMES['identity']} | {f2(b['top1']) if b else '-'} | — | "
               f"{b['best_epoch'] if b else '-'}/{len(b['log']) if b else '-'} |"]
-        for r in DOT6_METHODS:
+        for r in EXT_METHODS:
             d = res.get((ds, r, 0.5, 0, DOT6_TAG))
             diff = f"{d['top1'] - b['top1']:+.2f}".replace(".", ",") if d and b else "-"
             L.append(f"| {DOT6_NAMES[r]} | {f2(d['top1']) if d else '-'} | {diff} | "
@@ -596,13 +740,256 @@ def plot_dot6(a, res, base):
     plt.close(fig)
 
 
+def report_dot7(a):
+    f2 = lambda x: f"{x:.2f}".replace(".", ",")
+    sd = lambda d: " / ".join(f"{x:+.2f}".replace(".", ",") for x in d) or "-"
+    res = load_results(a.out, with_ds=True)
+
+    def runs(ds, key, ratio, seeds=SEEDS):
+        """key = phương pháp, hoặc LOWRES = giảm độ phân giải cùng cột (192 / 160 / 112 px ứng với giữ 75 / 50 / 25%)"""
+        if key == LOWRES:
+            return [res.get((ds, "identity", 1.0, s, res_tag(DOT7_SIZE_OF[ratio]))) for s in seeds]
+        return [res.get((ds, key, ratio, s, DOT6_TAG)) for s in seeds]
+
+    top = lambda ds, key, ratio: [d["top1"] for d in runs(ds, key, ratio) if d]
+    gm = lambda ds, key, ratio: next((d["GMACs"] for d in runs(ds, key, ratio) if d), None)
+    paired = lambda ds, k, m, ratio: [x["top1"] - y["top1"] for x, y in zip(runs(ds, k, ratio), runs(ds, m, ratio))
+                                      if x and y]
+    L = ["# Đợt 7: hai tập chính (CIFAR-100, Food-101) và đối chứng giảm độ phân giải", "",
+         "Cấu hình chung (như đợt 6): Vim-Ti pretrain ImageNet-1K, giảm token ở đầu vào, lr backbone 5e-5, lr head và bộ "
+         "chấm điểm 1e-3, Prune st + --prune_norm, mixup 0,2 (trong vòng train), label smoothing 0,1, chưng cất KL 0,5 "
+         "từ baseline 100% token cùng dataset, chọn mô hình theo val, test dùng 1 lần. Baseline không chưng cất.", "",
+         "**Giảm độ phân giải** (`--img_size`): Vim-Ti không có bộ giảm token; ảnh 224 của data loader (cùng augment với "
+         "mọi phương pháp) được thu nhỏ còn 192 / 160 / 112 px (bilinear, antialias) ngay trước patch embedding, tức "
+         "144 / 100 / 49 patch token, xếp vào cột giữ 75 / 50 / 25% (147 / 98 / 49 token). Pos-embed của checkpoint được "
+         "nội suy từ lưới 14×14 (bicubic, ô CLS giữ ở giữa dãy). Có chưng cất như các phương pháp giảm token (teacher "
+         "vẫn nhìn ảnh 224). GMACs của nó ghi ngay trong ô vì hơi khác cột.", ""]
+    L += dot7_data_lines(res)
+    for ds, title in DOT7_MAIN.items():
+        base = top(ds, "identity", 1.0)
+        epochs = next((d["args"]["epochs"] for d in runs(ds, "kan_pool", 0.5) + runs(ds, "identity", 1.0) if d), None)
+        heads = [f"Giữ {round(r * 100)}% ({f2(gm(ds, 'kan_pool', r)) if gm(ds, 'kan_pool', r) else '-'} GMACs)"
+                 for r in DOT6_RATIOS]
+        L += ["", f"## {title} ({epochs or '?'} epoch, 3 seed)", "",
+              f"Baseline Vim-Ti (100% token, 224 px): **{fmt(base)}** (n={len(base)}).", "",
+              "Test top-1 (%), trung bình ± độ lệch; (…) = chênh so với trung bình baseline; n < 3 = chưa đủ seed.", "",
+              "| Phương pháp | " + " | ".join(heads) + " |", "|---|---|---|---|"]
+        for key in DOT7_METHODS + [LOWRES]:
+            cells = []
+            for ratio in DOT6_RATIOS:
+                xs = top(ds, key, ratio)
+                c = fmt(xs) + (f" (n={len(xs)})" if 0 < len(xs) < 3 else "")
+                if xs and base:
+                    c += f" ({statistics.mean(xs) - statistics.mean(base):+.2f})".replace(".", ",")
+                if key == LOWRES:
+                    g = gm(ds, key, ratio)
+                    c += f"; {DOT7_SIZE_OF[ratio]} px, {f2(g) if g else '-'} G"
+                cells.append(c)
+            name = DOT7_NAMES[key] + (" (192 / 160 / 112 px)" if key == LOWRES else "")
+            L.append(f"| {'**' + name + '**' if key == LOWRES else name} | {' | '.join(cells)} |")
+        L += ["", "### Hiệu số ghép cặp theo seed (điểm %)", "",
+              "KPI đặt trước: **đạt** nếu hiệu số dương ở cả 3 seed và trung bình > 2 × độ lệch chuẩn. Các dòng \"− giảm "
+              "độ phân giải\" trả lời câu hỏi \"sao không giảm kích thước ảnh ngay từ đầu?\" (cùng cột = cùng mức token).",
+              "", "| Cặp | Giữ 75% / 192 px | Giữ 50% / 160 px | Giữ 25% / 112 px |", "|---|---|---|---|"]
+        pairs = [(k, m, n) for k, m, n in DOT6_PAIRS] + [(k, LOWRES, f"{DOT7_NAMES[k]} − giảm độ phân giải")
+                                                         for k in DOT7_LOWRES_PAIRS]
+        for k, m, name in pairs:
+            cells = []
+            for ratio in DOT6_RATIOS:
+                d = paired(ds, k, m, ratio)
+                cells.append(f"{fmt_d(d)}, {kpi(d)} ({sd(d)})" if d else "-")
+            L.append(f"| {name} | {' | '.join(cells)} |")
+        b0 = res.get((ds, "identity", 1.0, 0, DOT6_TAG))
+        if b0 and b0.get("throughput"):
+            L += ["", "### Tốc độ và bộ nhớ khi suy luận (seed 0, lô 64, đo ngay sau huấn luyện)", "",
+                  f"Baseline: {b0['throughput']:.0f} ảnh/s, {b0['vram_MB']:.0f} MB. Ô: tăng tốc so với baseline / VRAM (MB). "
+                  "GPU kia đang chạy job khác nên số có nhiễu; số để báo cáo nên đo lại bằng scripts/bench.py "
+                  "(có --img_sizes cho giảm độ phân giải).", "",
+                  "| Phương pháp | Giữ 75% / 192 px | Giữ 50% / 160 px | Giữ 25% / 112 px |", "|---|---|---|---|"]
+            for key in DOT7_METHODS + [LOWRES]:
+                cells = []
+                for ratio in DOT6_RATIOS:
+                    d = runs(ds, key, ratio, seeds=(0,))[0]
+                    cells.append(f"{d['throughput'] / b0['throughput']:.2f}× / {d['vram_MB']:.0f}".replace(".", ",")
+                                 if d and d.get("throughput") else "-")
+                L.append(f"| {DOT7_NAMES[key]} | {' | '.join(cells)} |")
+        L += dot7_diag_lines(ds, runs, f2)
+        plot_dot7(a, res, ds, title, runs, base)
+    L += dot7_delta_lines(res, f2)
+    L += dot7_in100_lines(res, a, f2)
+    for ds, title in {"tiny-imagenet": "Tiny-ImageNet"}.items():
+        b = res.get((ds, "identity", 1.0, 0, DOT6_TAG))
+        L += ["", f"## {title} (rút gọn: giữ 50%, seed 0, {a.ext_epochs} epoch; 6 phương pháp đầu và baseline lấy từ "
+                  "đợt 6)", "",
+              "| Phương pháp | Test top-1 (%) | Chênh so với baseline | Epoch tốt nhất |", "|---|---|---|---|",
+              f"| {DOT6_NAMES['identity']} | {f2(b['top1']) if b else '-'} | — | "
+              f"{b['best_epoch'] if b else '-'}/{len(b['log']) if b else '-'} |"]
+        for r in EXT_METHODS:
+            d = res.get((ds, r, 0.5, 0, DOT6_TAG))
+            diff = f"{d['top1'] - b['top1']:+.2f}".replace(".", ",") if d and b else "-"
+            L.append(f"| {DOT6_NAMES[r]} | {f2(d['top1']) if d else '-'} | {diff} | "
+                     f"{d['best_epoch'] if d else '-'}/{len(d['log']) if d else '-'} |")
+    open(os.path.join(a.out, "KET_QUA_DOT7.md"), "w", encoding="utf-8").write("\n".join(L) + "\n")
+
+
+def dot7_diag_lines(ds, runs, f2):
+    """Chẩn đoán của mô hình được giữ (val tốt nhất), trung bình các seed (json chạy trước khi có tính năng: bỏ qua)."""
+    mean = lambda ds_, key, ratio, k: (lambda v: sum(v) / len(v) if v else None)(
+        [d["diagnostics"][k] for d in runs(ds_, key, ratio) if d and k in d.get("diagnostics", {})])
+    cell = lambda v: f2(v) if v is not None else "-"
+    L = ["", "### Chẩn đoán (mô hình được giữ, trung bình các seed)", "",
+         "Gộp: entropy chuẩn hoá của trọng số softmax trong mỗi nhóm (1 = chia đều như Avg Pool) / trọng số lớn nhất của "
+         "nhóm (chia đều: con số ở dòng Avg Pool). Loại bỏ: khoảng cách lưới giữa hai token giữ liền nhau trong chuỗi / tỉ "
+         "lệ cặp liền nhau là hàng xóm trên ảnh / khoảng cách trung bình từ mỗi ô tới token giữ gần nhất (Static Drop ở "
+         "dòng cuối).", "", "| Phương pháp | Giữ 75% | Giữ 50% | Giữ 25% |", "|---|---|---|---|"]
+    for key in ("avg_pool", "kan_pool", "mlp_pool"):
+        L.append(f"| {DOT7_NAMES[key]} | " + " | ".join(
+            f"{cell(mean(ds, key, r, 'weight_entropy'))} / {cell(mean(ds, key, r, 'weight_max'))}" for r in DOT6_RATIOS) + " |")
+    for key in ("kan_prune", "mlp_prune"):
+        L.append(f"| {DOT7_NAMES[key]} | " + " | ".join(
+            " / ".join(cell(mean(ds, key, r, k)) for k in ("gap", "adjacent", "cover")) for r in DOT6_RATIOS) + " |")
+    ref = []
+    for r in DOT6_RATIOS:
+        d = next((d for key in DOT7_METHODS for d in runs(ds, key, r) if d and "static_drop_ref" in d.get("diagnostics", {})),
+                 None)
+        ref.append(" / ".join(cell(d["diagnostics"]["static_drop_ref"][k]) for k in ("gap", "adjacent", "cover"))
+                   if d else "-")
+    L.append(f"| Static Drop (vị trí cố định) | {' | '.join(ref)} |")
+    l1 = [d["log"][-1] for key in ("kan_pool", "kan_prune") for r in DOT6_RATIOS for d in runs(ds, key, r)
+          if d and "l1_term" in d["log"][-1] and d["log"][-1].get("ce")]
+    if l1:
+        share = sum(x["l1_term"] / (x["ce"] + x["l1_term"] + x.get("kd_term", 0.0)) for x in l1) / len(l1)
+        pct = f"{100 * share:.2g}".replace(".", ",")
+        L += ["", f"Phạt L1 của KAN (hệ số 1e-4) chiếm trung bình {pct}% tổng loss ở epoch cuối ({len(l1)} job KAN): "
+                  "gần 0 nghĩa là L1 gần như không tác động."]
+    return L
+
+
+def dot7_delta_lines(res, f2):
+    L = ["", "## Đối chứng Δ: chọn token bằng Δ của Mamba, không học (CIFAR-100, sau khối 6, 3 seed)", "",
+         "Điểm của token = Δ trung bình (chiều tiến + lùi) do khối 6 tự tính; giữ M−1 token điểm cao + 1 token gộp phần bị "
+         "loại (cùng cấu trúc với KAN Prune, chỉ khác cách chấm điểm). Cấu hình như đợt ctx / r25 (lr 5e-5, 30 epoch, "
+         "chưng cất), bản pure (backbone chính thức không cho đọc Δ). Mốc lấy từ results_ctx / results_r25; ở giữ 25% "
+         "KAN / MLP Prune là bản \"+ phủ đều 0,5\".", "",
+         "| Phương pháp | Giữ 50% (từng seed) | Giữ 50% | Giữ 25% (từng seed) | Giữ 25% |", "|---|---|---|---|---|"]
+    get = lambda r, q: [d["top1"] for d in (res.get(("cifar100", r, q, s, DELTA_TAG)) for s in SEEDS) if d]
+    sd = lambda v: " / ".join(f2(x) for x in v) or "-"
+    for r in DELTA_METHODS:
+        L.append(f"| **{L6_NAMES[r]}** | {sd(get(r, 0.5))} | **{fmt(get(r, 0.5))}** | {sd(get(r, 0.25))} | **{fmt(get(r, 0.25))}** |")
+    for r in ("kan_pool", "mlp_pool", "static_drop", "avg_pool", "kan_prune", "mlp_prune"):
+        L.append(f"| {L6_NAMES[r]} | " + " | ".join(f"{sd(L6_REF[q].get(r, []))} | {fmt(L6_REF[q].get(r, []))}"
+                                                   for q in (0.5, 0.25)) + " |")
+    L += ["", "Hiệu số ghép cặp theo seed (phương pháp − Δ Prune), KPI như trên:", "",
+          "| Cặp | Giữ 50% | Giữ 25% |", "|---|---|---|"]
+    for r in DELTA_METHODS:
+        for k in ("kan_pool", "kan_prune", "mlp_pool", "static_drop"):
+            cells = []
+            for q in (0.5, 0.25):
+                dl = [res.get(("cifar100", r, q, s, DELTA_TAG)) for s in SEEDS]
+                d = [x - y["top1"] for x, y in zip(L6_REF[q].get(k, []), dl) if y]
+                cells.append(f"{fmt_d(d)}, {kpi(d)}" if d else "-")
+            L.append(f"| {L6_NAMES[k]} − {L6_NAMES[r]} | {' | '.join(cells)} |")
+    return L
+
+
+def dot7_in100_lines(res, a, f2):
+    """ImageNet-100 làm lại: val / test = hai nửa (2.500 / 2.500) val chính thức, không thuộc tập pretrain."""
+    L = ["", f"## ImageNet-100 (làm lại: val sạch; giữ 50%, seed 0, {a.ext_epochs} epoch)", "",
+         "Val / test = hai nửa cân bằng theo lớp (2.500 / 2.500 ảnh) của val chính thức ImageNet, không nằm trong tập "
+         "pretrain ImageNet-1K; train dùng đủ 130.000 ảnh. Đợt 6 lấy val từ ảnh train (đã có trong pretrain): val cao hơn "
+         "test 3–6 điểm, Prune chọn mô hình ở epoch 0–1. Test 2.500 ảnh: khoảng tin cậy 95% ≈ ±1,3 điểm. Cột đợt 6 chỉ "
+         "để tham khảo (test khác: 5.000 ảnh).", "",
+         "| Phương pháp | Val | **Test** | Val − Test | Chênh test so với baseline | Epoch tốt nhất | Test đợt 6 (val nhiễm) |",
+         "|---|---|---|---|---|---|---|"]
+    b = res.get(("imagenet-100", "identity", 1.0, 0, IN100_TAG))
+    for r in ["identity"] + EXT_METHODS:
+        d = res.get(("imagenet-100", r, 0.5 if r != "identity" else 1.0, 0, IN100_TAG))
+        old = res.get(("imagenet-100", r, 0.5 if r != "identity" else 1.0, 0, DOT6_TAG))
+        diff = "—" if r == "identity" else (f"{d['top1'] - b['top1']:+.2f}".replace(".", ",") if d and b else "-")
+        L.append(f"| {DOT6_NAMES[r]} | {f2(d['val_top1']) if d else '-'} | **{f2(d['top1']) if d else '-'}** | "
+                 f"{f2(d['val_top1'] - d['top1']) if d else '-'} | {diff} | "
+                 f"{str(d['best_epoch']) + '/' + str(len(d['log'])) if d else '-'} | {f2(old['top1']) if old else '-'} |")
+    return L
+
+
+def dot7_data_lines(res):
+    """Cấu hình biến đổi ảnh đọc lại từ json (train.py ghi từ chính các DataLoader đã dùng), để kiểm: mọi job của một
+    dataset phải dùng cùng biến đổi, val phải dùng biến đổi của eval."""
+    from kanvim.data import format_transform
+    L = ["## Dữ liệu và biến đổi ảnh (đọc lại từ json)", ""]
+    for ds in list(DOT7_MAIN) + list(DOT6_EXT):
+        ds_runs = [d for k, d in res.items() if k[0] == ds]
+        if not ds_runs:
+            continue
+        cfg = [d["data"] for d in ds_runs if "data" in d]
+        title = {**DOT7_MAIN, **DOT6_EXT}[ds]
+        if not cfg:
+            L += [f"- **{title}**: {len(ds_runs)} job, chưa job nào ghi cấu hình dữ liệu (chạy trước khi có tính năng này).",
+                  ""]
+            continue
+        kinds = {json.dumps(c["transform"], sort_keys=True) for c in cfg}
+        sizes = {(c["n_train"], c["n_val"], c["n_test"]) for c in cfg}
+        c = cfg[0]
+        L += [f"- **{title}**: {len(cfg)}/{len(ds_runs)} job có ghi cấu hình; train / val / test = "
+              + "; ".join(" / ".join(f"{n:,}".replace(",", ".") for n in s) for s in sorted(sizes))
+              + f" (test = {c['test_split']}, val tách từ train, cố định)"
+              + ("" if len(kinds) == 1 else f". **CẢNH BÁO: {len(kinds)} cấu hình biến đổi khác nhau giữa các job**")
+              + ("" if all(x.get("val_uses_eval_transform") for x in cfg) else ". **CẢNH BÁO: val không dùng biến "
+                                                                              "đổi của eval**"),
+              f"  - train: `{format_transform(c['transform']['train'])}`",
+              f"  - val / test: `{format_transform(c['transform']['test'])}`"]
+        low = {(d["model_input"]["img_size"], d["model_input"]["patch_tokens"]) for d in ds_runs if "model_input" in d
+               and d["model_input"]["img_size"] != c["pipeline_size"]}
+        if low:
+            L.append(f"  - giảm độ phân giải: ảnh {c['pipeline_size']} px thu nhỏ trong mô hình còn "
+                     + ", ".join(f"{s} px ({t} token)" for s, t in sorted(low, reverse=True)))
+        L.append("")
+    return L
+
+
+def plot_dot7(a, res, ds, title, runs, base):
+    """Top-1 theo GMACs: 7 phương pháp + giảm độ phân giải (trung bình ± độ lệch qua các seed)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for key in DOT7_METHODS + [LOWRES]:
+        pts = []
+        for ratio in DOT6_RATIOS:
+            ds_runs = [d for d in runs(ds, key, ratio) if d]
+            if ds_runs:
+                xs = [d["top1"] for d in ds_runs]
+                pts.append((ds_runs[0]["GMACs"], statistics.mean(xs), statistics.stdev(xs) if len(xs) > 1 else 0.0))
+        if pts:
+            style = dict(color="black", linestyle=":", marker="s") if key == LOWRES else \
+                dict(linestyle="--" if "prune" in key or key == "static_drop" else "-", marker="o")
+            ax.errorbar(*zip(*[(g, m) for g, m, _ in pts]), yerr=[s for *_, s in pts], capsize=3, label=DOT7_NAMES[key],
+                        **style)
+    b = [d for d in runs(ds, "identity", 1.0) if d]
+    if b:
+        ax.errorbar([b[0]["GMACs"]], [statistics.mean(base)], yerr=[statistics.stdev(base) if len(base) > 1 else 0.0],
+                    marker="*", markersize=12, color="black", capsize=3, label=DOT6_NAMES["identity"])
+    ax.set_xlabel("GMACs / ảnh")
+    ax.set_ylabel("Top-1 trên tập kiểm tra (%)")
+    ax.set_title(f"{title}: độ chính xác theo chi phí (chấm đen: giảm độ phân giải)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(a.out, f"fig_dot7_{ds}.png"), dpi=150)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default=os.path.join(ROOT, "data"))
     ap.add_argument("--ckpt", default=os.path.join(ROOT, "vim_t.pth"))
     ap.add_argument("--teacher", default=os.path.join(ROOT, "teacher", "teacher_cifar100.pt"))
     ap.add_argument("--impl", default="auto", choices=["auto", "pure", "official"])
-    ap.add_argument("--out", default=os.path.join(ROOT, "results_fix"))
+    ap.add_argument("--out", default=None,
+                    help="mặc định results_fix; --dot7: results_dot7 (--quick: results_quick_dot7)")
     ap.add_argument("--patience", type=int, default=6, help="0 = chạy đủ 30 epoch (vẫn chọn model theo val tốt nhất)")
     ap.add_argument("--prune_norm", action="store_true", help="chuẩn hoá điểm theo từng ảnh (sửa lỗi điểm KAN sụp / MLP phình)")
     ap.add_argument("--limit", type=int, default=0, help=">0: chỉ chạy N job đầu còn thiếu (chạy thử)")
@@ -619,7 +1006,16 @@ def main():
     ap.add_argument("--dot6", action="store_true",
                     help="đợt 6: CIFAR-100 đủ 7 phương pháp x giữ 75/50/25%% x 3 seed + Tiny-ImageNet / ImageNet-100 "
                          "rút gọn, giảm ở đầu vào, lr 5e-5; bảng KET_QUA_DOT6.md")
-    ap.add_argument("--ext_epochs", type=int, default=10, help="--dot6: số epoch cho Tiny-ImageNet và ImageNet-100")
+    ap.add_argument("--dot7", action="store_true",
+                    help="đợt 7: Food-101 đủ 7 phương pháp x giữ 75/50/25%% x 3 seed, đối chứng giảm độ phân giải "
+                         "(192/160/112 px) trên CIFAR-100 và Food-101, Static Drop Tiny-ImageNet, ImageNet-100 làm lại với val sạch; "
+                         "bảng KET_QUA_DOT7.md")
+    ap.add_argument("--food_epochs", type=int, default=30, help="--dot7: số epoch cho Food-101 (CIFAR-100: 30)")
+    ap.add_argument("--dot6_dir", default=os.path.join(ROOT, "results_dot6"),
+                    help="--dot7: thư mục kết quả đợt 6 (giải nén results_dot6.zip): json để so và teacher "
+                         "Tiny-ImageNet / ImageNet-100")
+    ap.add_argument("--ext_epochs", type=int, default=10,
+                    help="--dot6 / --dot7: số epoch cho Tiny-ImageNet và ImageNet-100")
     ap.add_argument("--reduce_at", type=int, default=6, help="--ctx_round / --r25_round: giảm token trước khối này")
     ap.add_argument("--quick", action="store_true",
                     help="chạy thử: mỗi job 2 epoch x 20 bước, không đo tốc độ (dùng --out riêng, vd results_quick)")
@@ -627,11 +1023,14 @@ def main():
     ap.add_argument("--gpus", default=None, help="vd '0,1'. Mặc định: tất cả GPU")
     ap.add_argument("--workers", type=int, default=min(12, os.cpu_count() or 4))
     a = ap.parse_args()
-    a.ext_ds = []  # --dot6: prepare() điền các dataset phụ có sẵn
-    if a.stab_round or a.ctx_round or a.r25_round or a.dot6:
+    a.ext_ds = []  # --dot6 / --dot7: prepare() điền các dataset phụ có sẵn
+    assert not (a.dot6 and a.dot7), "chọn một đợt"
+    if a.out is None:
+        a.out = os.path.join(ROOT, ("results_quick_dot7" if a.quick else "results_dot7") if a.dot7 else "results_fix")
+    if a.stab_round or a.ctx_round or a.r25_round or a.dot6 or a.dot7:
         a.prune_norm = True
-    if a.dot6:
-        a.patience = 0  # như results_lr: 16 job giữ 50% dùng lại phải cùng cấu hình
+    if a.dot6 or a.dot7:
+        a.patience = 0  # như results_lr: 16 job giữ 50% dùng lại phải cùng cấu hình; đợt 7 so với đợt 6
     import torch
     gpus = [int(g) for g in a.gpus.split(",")] if a.gpus else list(range(torch.cuda.device_count()))
     if not gpus:
@@ -640,11 +1039,11 @@ def main():
         sys.exit(f"thiếu teacher {a.teacher}")
     prepare(a)
     failed = run_all(a, gpus)
-    report(a)
+    safe_report(a)
     shutil.make_archive(a.out, "zip", os.path.dirname(a.out), os.path.basename(a.out))
     done = "XONG CHẠY THỬ" if a.limit else "XONG TOÀN BỘ"
     log(f"{done if not failed else 'XONG, có job lỗi: ' + ', '.join(failed)}. "
-        f"Bảng: {a.out}/{'KET_QUA_DOT6.md' if a.dot6 else 'KET_QUA_R25.md' if a.r25_round else 'KET_QUA_CTX.md' if a.ctx_round else 'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
+        f"Bảng: {a.out}/{'KET_QUA_DOT6.md' if a.dot6 else 'KET_QUA_DOT7.md' if a.dot7 else 'KET_QUA_R25.md' if a.r25_round else 'KET_QUA_CTX.md' if a.ctx_round else 'KET_QUA_STAB.md' if a.stab_round else 'KET_QUA_LR.md' if a.lr_round else 'KET_QUA_FIX.md'}"
         f" | tải về: {a.out}.zip")
 
 

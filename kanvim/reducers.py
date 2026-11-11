@@ -101,6 +101,37 @@ class StaticDrop(Reducer):
         return x[:, self.idx]
 
 
+class DeltaPrune(Reducer):
+    """Training-free score, the control for the learned scorers: Mamba's own Delta. The score of a token is
+    mean_d(Delta_fwd + Delta_bwd) computed by the block just before this reducer (the MTR score, set by ReducedVim
+    as self.score), so it only exists after >= 1 block (--reduce_at >= 1) and with the pure backbone (which exposes
+    Delta). Same output layout as PruneReducer st: the M-1 top-scored tokens in original order + one fused token = mean
+    of the dropped ones; only the scoring differs. sign=+1 keeps large Delta, -1 keeps small Delta.
+    Direction check (fine-tuned Vim-Ti, CIFAR-100, after block 6, keep 50%, 256 test images, no retraining): large Delta
+    78.5%, small Delta 63.3%, random 82.4%, Static Drop 84.0%, baseline 89.5%: hence delta_prune (large) is the control."""
+    needs_delta = True
+
+    def __init__(self, n_tokens, keep_ratio, sign=1.0):
+        super().__init__(n_tokens, keep_ratio)
+        self.sign = sign
+        self.score = None
+
+    def forward(self, x):
+        b, n, d = x.shape
+        s, self.score = self.score, None  # used once: set by ReducedVim right before every call
+        if s is None or tuple(s.shape) != (b, n):
+            assert s is None, (tuple(s.shape), (b, n))
+            s = x.new_zeros(b, n)  # no Delta given: only for MAC counting (metrics.reducer_macs)
+        s = self.sign * s.detach().float()
+        k = self.m - 1
+        idx = s.topk(k, dim=1).indices.sort(1).values
+        kept = x.gather(1, idx.unsqueeze(-1).expand(-1, -1, d))
+        drop = torch.ones(b, n, dtype=torch.bool, device=x.device).scatter_(1, idx, False)
+        fused = (x.float() * drop.unsqueeze(-1)).sum(1, keepdim=True) / (n - k)
+        self.aux = {"logits": s, "idx": idx}
+        return torch.cat([kept, fused.to(x.dtype)], 1)
+
+
 class RandomDrop(Reducer):
     def forward(self, x):
         b, n, d = x.shape
@@ -201,6 +232,8 @@ def build_reducer(name, dim, grid_hw, keep_ratio, kan_hidden=32, grid_size=5, pr
     simple = {"static_drop": StaticDrop, "random_drop": RandomDrop}
     if name in simple:
         return simple[name](n, keep_ratio)
+    if name in ("delta_prune", "delta_prune_low"):
+        return DeltaPrune(n, keep_ratio, 1.0 if name == "delta_prune" else -1.0)
     kind, op = name.split("_")[0], name.split("_")[1]
     if kind in ("avg", "max") and op == "pool":
         return PoolReducer(n, keep_ratio, grid_hw, kind)

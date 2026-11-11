@@ -1,111 +1,106 @@
-# Hướng dẫn chạy TOÀN BỘ thí nghiệm của đồ án
+# Hướng dẫn chạy (đợt 7)
 
-Chỉ cần chạy **một lệnh** (máy thuê) hoặc bấm **một nút** (Kaggle). Script `scripts/run_plan.py` tự làm hết các bước sau, **theo thứ tự ưu tiên**:
+Một lệnh chạy toàn bộ đợt 7: `scripts/run_fix.py --dot7`. Hai tập chính CIFAR-100 và Food-101; Tiny-ImageNet và
+ImageNet-100 chạy một phần. Bảng kết quả tự sinh: `results_dot7/KET_QUA_DOT7.md`.
 
-| Bước | Nội dung | Số lần train |
-|---|---|---|
-| 0 | Đo tốc độ GPU, **tự chọn số ảnh train / số epoch** để toàn bộ kế hoạch vừa `--budget_hours` | - |
-| 1 | Dò learning rate cho baseline (2e-5, 5e-5, 1e-4), chọn theo validation | 3 (ngắn) |
-| 2 | Baseline Vim-Ti (100% token) trên CIFAR-100, lưu làm teacher | 1 |
-| 3 | 6 phương pháp (KANPool, MLP Pool, Avg Pool, Max Pool, KAN Prune, MLP Prune) giữ 50% | 6 |
-| 4 | MTR (training-free, không train) giữ 75/50/25% | 0 (chỉ đánh giá) |
-| 5 | 6 phương pháp giữ 75% và 25% | 12 |
-| 6 | Baseline + 6 phương pháp (50%) với seed 1 và 2 → trung bình ± độ lệch chuẩn | 14 |
-| 7 | Đối chứng Static drop, Random drop + giảm token nhiều tầng (KAN/MLP Prune 3 tầng) | 4 |
-| 8 | Dataset thứ hai **Tiny-ImageNet**: baseline + 6 phương pháp (50%) + MTR | 7 |
-| 9 | Ablation KAN (KANPool, KAN Prune): grid 3/8, hidden 16/64, bỏ L1, bỏ distillation | 12 |
-| 10 | Báo cáo `BAO_CAO.md` + `ket_qua.csv` + hình | - |
+Hướng dẫn của các đợt trước (`scripts/run_plan.py`, Kaggle / Colab, đợt 1–6 của `run_fix.py`) không còn dùng; xem lại
+trong lịch sử git: `git show 8e503ed:HUONG_DAN_CHAY.md` và `git show 8e503ed:HUONG_DAN_CHAY_FIX.md`.
 
-Tổng cộng khoảng **59 lần train**. Mỗi lần train theo quy trình chuẩn: tách **validation** cố định từ tập train → chọn model theo val, **early stopping** → **test 1 lần duy nhất** ở cuối. Chống overfitting: augmentation, label smoothing, weight decay, mixup, gradient clipping.
+## Đợt 7 làm gì
 
-**Bị ngắt / hết giờ:** chạy lại đúng lệnh cũ. Phần đã xong được giữ, lần train đang dở chạy tiếp từ epoch cuối. Bước nào chưa kịp thì báo cáo vẫn được tạo với những gì đã có.
+Nội dung (cùng cấu hình đợt 6: giảm ở đầu vào, lr backbone 5e-5, `--prune_norm`, patience 0, mixup 0,2, chưng cất):
+- **Food-101** thành tập chính, đủ ma trận như CIFAR-100: baseline × 3 seed (seed 0 lưu làm teacher), KANPool, MLP Pool,
+  Avg Pool, Max Pool, KAN Prune, MLP Prune, Static Drop × giữ 75 / 50 / 25% × 3 seed, 30 epoch (`--food_epochs`).
+  Ảnh Food-101 giờ dùng quy trình của ImageNet-100: train `RandomResizedCrop(224)` + lật; eval `Resize(256)` + `CenterCrop(224)`.
+- **Giảm độ phân giải** (`train.py --img_size`): ảnh 192 / 160 / 112 px = 144 / 100 / 49 token (≈ giữ 75 / 50 / 25%),
+  Vim-Ti không có bộ giảm token, pos-embed nội suy từ lưới 14×14, có chưng cất như mọi phương pháp giảm token.
+  Chạy trên CIFAR-100 và Food-101, 3 seed.
+- **Static Drop** cho Tiny-ImageNet (giữ 50%, seed 0, 10 epoch, teacher của đợt 6).
+- **ImageNet-100 làm lại** cả 8 job (baseline + 7 phương pháp kể cả Static Drop, giữ 50%, seed 0, 10 epoch) với val sạch:
+  `--val_from test` chia đôi val chính thức (2.500 val / 2.500 test, cân bằng theo lớp). Đợt 6 lấy val từ ảnh train,
+  vốn nằm trong tập pretrain ImageNet-1K, nên val bị "nhiễm" (cao hơn test 3–6 điểm, chọn sai epoch).
+- Mỗi file json giờ ghi thêm `data` (biến đổi ảnh train / val / test đọc lại từ chính DataLoader, số ảnh), `model_input`
+  (kích thước ảnh, số token, cách thu nhỏ), `train_recipe` (mixup, label smoothing, chưng cất, teacher), `env`.
 
-> **Về thời gian:** 59 lần train là khối lượng lớn. Script tự thu nhỏ số ảnh/epoch để vừa `--budget_hours`, nhưng nếu ngân sách quá nhỏ thì số ảnh train sẽ rất ít (kết quả kém tin cậy). Thực tế:
-> - Máy thuê **2 GPU** (ví dụ 2×RTX 4090) chạy song song 2 lần train một lúc → nhanh gấp đôi.
-> - Kaggle (miễn phí, T4, bản chậm): chỉ đủ cho các bước đầu trong vài ngày; các bước sau chạy tiếp ở các phiên sau.
+- **Đối chứng Δ** (`--reducer delta_prune`): chọn token bằng Δ có sẵn của Mamba (không học), CIFAR-100, sau khối 6, giữ
+  50% / 25%, 3 seed; so ghép cặp với KAN/MLP Pool, Static Drop, KAN Prune của đợt ctx / r25 (cùng cấu hình). Chạy bằng
+  bản pure (backbone chính thức không cho đọc Δ), nên chậm hơn ~25%.
+- JSON ghi thêm chẩn đoán: KAN/MLP Pool có thật sự ưu tiên token không (entropy trọng số, so với Avg Pool = 1), token
+  Prune giữ lại nằm rải rác hay dồn cụm (so với Static Drop), phần thật của từng thành phần loss (CE / L1 / KD).
 
----
+**99 job: pha 1 (6 job) ~2,5 giờ, pha 2 (93 job, chủ yếu Food-101 ~85–90 phút/job) ~62 giờ trên 2 × RTX 4090.**
+Pha 2 xếp theo seed: seed 0 của mọi job Food-101 xong trước (~18 giờ), dừng giữa chừng vẫn có đủ một đường cong.
 
-## Cách A: Thuê GPU (khuyên dùng)
+## Chạy trên máy GPU mới (từng bước)
 
-Ví dụ với **RunPod** (vast.ai làm tương tự).
+**0. Thuê máy:** vast.ai / RunPod, **2 × RTX 4090** (không chọn RTX 5090 / RTX PRO Blackwell), image
+`pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel`, **disk ≥ 100 GB** (Food-101 ~10 GB, ImageNet-100 ~30 GB, checkpoint,
+kết quả). Thời gian chạy ~60 giờ: chọn máy cho thuê dài, không bị ngắt (không dùng "interruptible").
 
-1. Vào [runpod.io](https://www.runpod.io), đăng ký, nạp **25–40 USD** (thẻ Visa/Mastercard).
-2. **Pods → Deploy**:
-   - GPU: **2 × RTX 4090** (khoảng 0,8–1,4 USD/giờ cho 2 GPU). Hoặc 1 × A100 / H100.
-   - Template: **RunPod Pytorch 2.1** (image `runpod/pytorch:2.1.1-py3.10-cuda11.8.0-devel-ubuntu22.04`). Đúng bản 2.1 + CUDA 11.8 thì cài được kernel CUDA chính thức của Vim (nhanh hơn nhiều).
-   - Container disk 40 GB, Volume 30 GB → **Deploy**.
-3. Khi pod chạy: **Connect → Jupyter Lab**. Kéo thả file `D:\đồ án\kan-vim-v3.zip` vào `/workspace`.
-4. Mở **Terminal** trong Jupyter Lab, dán:
-   ```bash
-   cd /workspace && unzip -o kan-vim-v3.zip && cd kan-vim
-   bash scripts/setup_rent.sh
-   bash scripts/run_rent.sh --budget_hours 30
-   ```
-   `--budget_hours 30` = "tôi muốn toàn bộ xong trong khoảng 30 giờ". Script tự chọn quy mô. Muốn xong sớm hơn thì giảm số này (đổi lại ít ảnh train hơn).
-5. Xem tiến độ (đóng trình duyệt vẫn chạy):
-   ```bash
-   tail -f /workspace/kan-vim/run_plan.log
-   ```
-   Sau Bước 0, log in `KẾ HOẠCH: ...` và thời gian ước tính của từng bước.
-6. Xem kết quả tạm thời bất cứ lúc nào:
-   ```bash
-   cd /workspace/kan-vim && python scripts/report_plan.py results_plan
-   ```
-   rồi mở `results_plan/BAO_CAO.md` trong Jupyter Lab.
-7. Khi log in `XONG TOÀN BỘ`: tải `/workspace/kan-vim/results_plan.zip` về máy (chuột phải → Download).
-8. **Stop + Terminate pod** để không bị trừ tiền tiếp.
+**1. Đưa code và kết quả đợt 6 lên `/workspace`:** code lấy bằng
+`cd /workspace && git clone -b dot7 https://github.com/dqminh24/Kan-vim.git kan-vim` (khi đó bỏ qua lệnh giải nén
+`kan-vim-v5.zip` ở bước 2), hoặc upload `kan-vim-v5.zip`; và upload `results_dot6.zip` (trên máy của bạn nằm ở
+`result/results_dot6.zip`; cần teacher Tiny-ImageNet và json đợt 6 để so).
 
----
-
-## Cách B: Kaggle (miễn phí, chậm)
-
-1. Tài khoản Kaggle → **Settings → Phone verification** (bắt buộc để dùng GPU + Internet).
-2. **Datasets → New Dataset** → upload `D:\đồ án\kan-vim-v3.zip`, đặt tên `kan-vim` → **Create**.
-3. **Code → New Notebook → File → Import Notebook** → chọn `D:\đồ án\kan-vim\notebooks\kaggle_plan.ipynb`.
-4. Thanh bên phải: **Accelerator → GPU T4 x2**, **Internet → On**, **Add Input** → dataset `kan-vim` của bạn.
-5. **Save Version → Save & Run All (Commit) → Save**. Kaggle chạy nền, tắt máy cũng được.
-6. Sau khoảng 11 giờ notebook tự dừng an toàn. Mở log của version:
-   - `XONG TOÀN BỘ` → tab **Output** → tải `results_plan.zip`.
-   - `ĐÃ TẠM DỪNG` → **chạy tiếp**:
-     1. Mở lại notebook (**Edit**).
-     2. **Add Input → Your Work → Notebooks** → chọn chính notebook này (version mới nhất) → Add. (Từ lần thứ 3: ở mục Input, đổi sang version mới nhất.)
-     3. **Save Version → Save & Run All**. Cell 1 in `khôi phục kết quả phiên trước`.
-
-Hạn mức Kaggle: 30 giờ GPU/tuần. Mỗi phiên vẫn tạo `results_plan.zip` với những gì đã xong.
-
----
-
-## Chỉ chạy một phần
-
+**2. Cài đặt (10–30 phút):**
 ```bash
-python scripts/run_plan.py --profile gpu --phases 1-4      # chỉ bước 1-4 (cốt lõi + MTR)
-python scripts/run_plan.py --profile gpu --phases 8        # chỉ Tiny-ImageNet
-python scripts/run_plan.py --profile gpu --phases 1-3,5    # bỏ qua MTR, seed, ...
-python scripts/run_plan.py --profile gpu --train_subset 20000 --epochs 30   # ép cấu hình
-python scripts/run_plan.py --profile gpu --replan          # đo và chọn lại cấu hình (xoá plan.json)
+cd /workspace && python -m zipfile -e kan-vim-v5.zip . && cd kan-vim       # image không có sẵn unzip
+bash scripts/setup_rent.sh                     # cài kernel Vim chính thức, pytest, matplotlib, huggingface_hub
+python -m zipfile -e /workspace/results_dot6.zip .                          # -> kan-vim/results_dot6/*.json, teacher_*.pt
+ls results_dot6/teacher_tiny-imagenet.pt       # phải có (nếu thấy results_dot6/results_dot6/ là giải nén sai chỗ)
+python -c "from huggingface_hub import hf_hub_download as d; import shutil; shutil.copy(d('hustvl/Vim-tiny-midclstok', 'vim_t_midclstok_76p1acc.pth'), 'vim_t.pth')"
 ```
-Lưu ý: cấu hình (số ảnh, epoch) được chọn **một lần** ở lần chạy đầu và ghi vào `results_plan/plan.json` để mọi lần train dùng cùng cấu hình (so sánh công bằng). Lần chạy đầu nên để `--phases` mặc định (1-9) để ngân sách tính cho toàn bộ kế hoạch.
 
-## Kiểm tra trên máy mình (không cần GPU)
-
+**3. ImageNet-100 (tuỳ chọn, ~30–60 phút; bỏ qua thì đợt 7 tự bỏ 8 job ImageNet-100):** bản Kaggle của Ambesh
+Shekhar, cần API key Kaggle (kaggle.com → Settings → API → Create New Token → file `kaggle.json`).
 ```bash
-cd "D:\đồ án\kan-vim"
-python scripts/run_plan.py --profile cpu-test --out results_cpu_test
+pip install -q kaggle && mkdir -p ~/.kaggle && cp /workspace/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+kaggle datasets download -d ambityga/imagenet100 -p /workspace/in100 --unzip   # lỗi 404: tìm "imagenet100" trên Kaggle
+python scripts/prep_imagenet100.py /workspace/in100      # phải in "thấy 100 lớp train, 100 lớp val", train ~130000, val 5000
 ```
-Chạy cả 9 bước với dữ liệu giả + backbone Vim rất nhỏ (khoảng 30–60 phút), chỉ để chắc chắn mọi thứ chạy hết và sinh `BAO_CAO.md`. Con số **không có ý nghĩa**.
 
----
+**4. Kiểm tra (bắt buộc, ~5 phút):**
+```bash
+python -m pytest -q                            # phải thấy "85 passed"
+python scripts/check_impl.py vim_t.pth         # phải in 2 dòng (224 px, 160 px) và USE_OFFICIAL
+```
+Không thấy `USE_OFFICIAL` thì vẫn chạy được (bản pure, chậm hơn ~25%), nhưng tốc độ không so được với đợt 6: nên
+kiểm lại `setup_rent.sh` trước.
 
-## Kết quả (`results_plan.zip`)
+**5. Chạy thử (~40–60 phút, gồm tải Food-101 ~5 GB lần đầu):** 10 job × (2 epoch × 20 bước), mỗi loại job một lần.
+```bash
+bash scripts/run_fix.sh --dot7 --quick && tail -f run_fix.log       # Ctrl+C chỉ thoát xem, không dừng chạy
+```
+Chờ log in `XONG CHẠY THỬ` / `XONG TOÀN BỘ` (hoặc `XONG, có job lỗi`: xem `results_quick_dot7/logs/<tên job>.log`). Kiểm:
+- `results_quick_dot7/KET_QUA_DOT7.md`, mục "Dữ liệu và biến đổi ảnh": Food-101 và ImageNet-100 là `RandomResizedCrop`,
+  CIFAR-100 / Tiny-ImageNet là `RandomCrop(... padding_mode=reflect)`, không có dòng **CẢNH BÁO**.
+- `grep -h "distill=\|patch tokens" results_quick_dot7/logs/*res160*.log` phải có `100 patch tokens` và
+  `distill=on (teacher 224 px)`.
+- `grep -h "data:" results_quick_dot7/logs/imagenet-100*.log` phải là `train ~130000 | val 2500 | test 2500`.
+- Đầu `run_fix.log` không có dòng `CẢNH BÁO: thiếu ... teacher`.
 
-| File | Nội dung |
-|---|---|
-| `BAO_CAO.md` | 11 mục: thiết lập, dò LR, kết quả chính, độ ổn định qua seed, các mức giữ, đối chứng + multi-stage + MTR, Tiny-ImageNet, ablation KAN, kiểm tra overfitting, chi phí tính toán, **so sánh rút gọn KAN vs MLP / học vs cố định / gộp vs loại bỏ / có train vs MTR** |
-| `ket_qua.csv` | Mọi lần chạy, mở bằng Excel |
-| `fig_acc_vs_gmacs.png` | Đánh đổi độ chính xác – GMACs ở 3 mức giữ |
-| `fig_curves.png`, `fig_curves_d2.png` | Train loss, val loss, val top-1 theo epoch (nhận xét overfitting) |
-| `fig_test_top1.png`, `fig_lr_search.png` | So sánh các phương pháp; dò LR |
-| `plan.json`, `logs/*.log` | Cấu hình đã chọn; log đầy đủ từng lần train |
+**5b. Đo thời gian thật trước khi chi tiền (~2 phút):** ước tính 85–90 phút/job Food-101 lấy từ ImageNet-100, chưa đo.
+```bash
+python train.py --dataset food101 --data_root data --ckpt vim_t.pth --impl official --batch 64 --workers 12   --val_size 5000 --reducer kan_pool --ratio 0.5 --teacher_ckpt results_quick_dot7/teacher_food101.pt --timing
+```
+Dòng `TIMING ... 1 epoch ~= X min`: một job Food-101 ≈ 30 × X phút, cả đợt ≈ 75 × 30 × X / 2 phút trên 2 GPU (cộng
+~10 giờ cho CIFAR-100 / ImageNet-100). Nếu `data` chiếm phần lớn thời gian mỗi bước thì máy thiếu CPU: tăng `--workers`
+hoặc chọn máy nhiều nhân hơn trước khi chạy thật.
 
-Gửi lại file zip này để viết phần kết quả, thảo luận và hướng phát triển.
+**6. Chạy thật (~58 giờ, nền, kết quả ở `results_dot7/`, tách riêng với chạy thử):**
+```bash
+bash scripts/run_fix.sh --dot7 && tail -f run_fix.log
+```
+Bảng `results_dot7/KET_QUA_DOT7.md` cập nhật sau mỗi job. Mất kết nối / máy khởi động lại: chạy lại đúng lệnh này, job
+xong được giữ, job dở chạy tiếp. Muốn dừng sớm: seed 0 của mọi job Food-101 xong sau ~20 giờ đầu.
+
+**7. Sau khi xong (GPU rảnh, không job nào khác chạy):** đo tốc độ cho bài (batch 1 = độ trễ, batch 64 = thông lượng;
+dòng đầu in rõ scan đang dùng), đánh giá giảm token **không huấn luyện lại** (vài phút / tập), rồi đóng gói và tải về:
+```bash
+python scripts/bench.py --ckpt vim_t.pth --impl official --img_sizes 192 160 112 --batches 1 64 --out results_dot7
+python scripts/eval_noretrain.py --dataset cifar100 --teacher_ckpt teacher/teacher_cifar100.pt --impl official --out results_dot7
+python scripts/eval_noretrain.py --dataset food101 --teacher_ckpt results_dot7/teacher_food101.pt --impl official --out results_dot7
+python scripts/eval_noretrain.py --dataset cifar100 --teacher_ckpt teacher/teacher_cifar100.pt --impl pure --reduce_at 6 --img_sizes --out results_dot7
+python -c "import shutil; shutil.make_archive('results_dot7', 'zip', '.', 'results_dot7')"   # đóng gói lại kèm bench
+```
+Kiểm tra mở được file zip trên máy mình rồi mới **Destroy** máy.

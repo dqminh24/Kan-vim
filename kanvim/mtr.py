@@ -9,6 +9,12 @@ Schedule (our choice, the paper does not fix it for Vim-Ti): an MTR module after
 the last, with one constant fraction k for all of them; k is chosen so that the mean sequence length
 over the blocks equals 196 * keep_ratio, i.e. the same GMACs as the single-stage reducers at that
 keep ratio. Needs the pure-PyTorch backbone (kanvim.vim_pure), which exposes Delta.
+
+Measured (fine-tuned Vim-Ti on CIFAR-100, 256 test images, no retraining): baseline 88.3%; keep 0.75: large Delta 83.2,
+small Delta 82.4, random 83.6; keep 0.5: large Delta 63.3, small Delta 74.2, random 77.0. So this every-block schedule
+hurts by itself (random also drops 11 points) and the Delta ranking is no better than random here: the 7.08% of
+results_plan at keep 0.25 is this, not a code error. A single-stage Delta control at the same place as the learned
+scorers is reducers.DeltaPrune (--reducer delta_prune --reduce_at 6).
 """
 import torch
 import torch.nn as nn
